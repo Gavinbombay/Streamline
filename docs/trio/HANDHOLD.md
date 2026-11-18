@@ -1,0 +1,66 @@
+# Streamline Handhold: Slices, Traceability, Custody, and Checklist
+
+Version: `0.1.0-d1`
+
+## 1. Vertical Slice Build Order (`L8`)
+
+Each slice reaches a real end-to-end journey on the actual binary before moving to the next:
+
+### Slice 1: Core Rust Server, SQLite + Vault Store, Redaction Gate, and Enforced MCP
+- Workspace setup (`Cargo.toml`, `check-toolchain.sh`, `crates/streamline-{core,safe,store,http}`), SQLite migrations, and two-way Obsidian markdown sync.
+- Full MCP + HTTP API for `ready`, `bootstrap`, `ack_rules` (mechanical precondition), shelves + Source Passports, profile + skill selection, scalable `P0`..`P4` Trio+ projects, `OWN` lock vs `DIV` log, `check_sync` / `save_sync_report`, `HOW-IT-WORKS` submission, and `/downloads/streamline-skills.zip` (the 4 portable skills).
+- **Exit proof**: Real loopback + LAN runs from both local agent clients (`Hermes` and desktop IDE) completing a `P1` Trio+ cycle end to end.
+
+### Slice 2: Hands-Off Conveyor (`streamline-conveyor`)
+- Read-only input staging (`0444`/`0555` + `SHA256SUMS` computed by Rust, not prompt prose), configurable CLI harness runner + optional `worker_lease_url` webhook, post-run `CLEANUP` verifier, `streamline-safe` output scan, automatic cross-family Acceptor QC trigger, and JSONL trajectory export.
+- **Exit proof**: One locked `P1` task dispatched hands-off -> built by Family A -> auto-checked by Family B -> lands in `DOC_PENDING_OWNER` with clean scratch space and verified hashes.
+
+### Slice 3: 3-Pane Web UI, Pluggable Presence Slot, Captures, and OSS Audit
+- Server-rendered / lightweight progressive 3-pane Web UI with locked Streamline CSS tokens, side-by-side diff highlights, `DOC_PENDING_OWNER` approval inbox, pluggable `presence_plugin_dir` mount, and scoped external token/OAuth grants.
+- `Beacon`-style README, badges, committed `.txt` + `.svg` captures (`docs/tools/render-captures.py`), `HOW-IT-WORKS.md`, and full 6-phase security audit (`AUDIT.md`) prior to any GitHub push decision.
+
+## 2. Requirements Trace Table (`L9`: `D I T A L`)
+
+| ID | Source | Requirement | Verification | D | I | T | A | L |
+| :--- | :--- | :--- | :--- | :-: | :-: | :-: | :-: | :-: |
+| `REQ-01` | `OWN-001` | Rust 1.98 + Axum + SQLite workspace builds cleanly offline/locked with zero Python product services | `check-toolchain.sh` + `cargo test --workspace` | X | | | | |
+| `REQ-02` | `OWN-004` | Mechanical `bootstrap` + `ack_rules` blocks write/dispatch calls (`412`) until current rules digest is acknowledged | Integration test `ack_gate_test` | X | | | | |
+| `REQ-03` | `OWN-004` | Tag-scoped grants enforce shelf/project read & write isolation (`403` on ungranted shelves) | Integration test `tag_isolation_test` | X | | | | |
+| `REQ-04` | `OWN-004` | `streamline-safe` rejects high-entropy credentials, private LAN literals (in public-safe mode), and banned patterns (`422`) | Unit + MCP negative suite `redaction_gate_test` | X | | | | |
+| `REQ-05` | `OWN-004` | Shelves and `SourcePassport` store steward, verified timestamp, freshness/drift state, and lineage | Store + HTTP round-trip test | X | | | | |
+| `REQ-06` | `OWN-008` | Two-way Obsidian markdown sync imports clean edits as revisions and flags conflicts without data loss | Store sync test `vault_sync_conflict_test` | X | | | | |
+| `REQ-07` | `OWN-004` | Profile and communication skills (`select_context`) serve active voice/rules without merging voices | MCP `select_context` contract test | X | | | | |
+| `REQ-08` | `OWN-004` | `create_trio_project` scales records from `P0` (1 fix record) to `P4` with idempotent retry (`request_id`) | Trio+ planner & retry suite | X | | | | |
+| `REQ-09` | `OWN-004` | `lock_project_plan` freezes `OWN` decisions (`409` on edit) while permitting `record_divergence` (`DIV`) | Mutation guard test `own_lock_test` | X | | | | |
+| `REQ-10` | `OWN-004` | `check_sync` pairs plan vs `AS-BUILT` rows and `save_sync_report` validates evidence references | Sync pairing & validation suite | X | | | | |
+| `REQ-11` | `OWN-004` | `streamline-conveyor` stages read-only inputs, runs builder, verifies `CLEANUP` + scan, and enforces `builder_family != acceptor_family` | Conveyor e2e harness test | X | | | | |
+| `REQ-12` | `OWN-007` | Release stays blocked at `DOC_PENDING_OWNER` until `HOW-IT-WORKS.md` passes section validation and owner calls `approve_release` | Release gate e2e test | X | | | | |
+| `REQ-13` | `OWN-004` | `/downloads/streamline-skills.zip` serves validated `director`, `worker`, `acceptor`, and `vault` skills | Archive byte & frontmatter check | X | | | | |
+| `REQ-14` | `OWN-005` | 3-pane Web UI preserves exact Streamline dark palette, `16px`/`14px` floors, `44px` targets, and expanded word diffs | DOM/CSS assertion suite | X | | | | |
+| `REQ-15` | `OWN-006` | Open-source UI renders default status mark while loading private Presence canvas only when `presence_plugin_dir` is configured | Plugin mount isolation test | X | | | | |
+| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, and `AUDIT.md` PASS | Official scanner + 6-phase audit | X | | | | |
+
+## 3. Four-Gate Independent Acceptance (`L10`)
+
+1. **Construction Quality**: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, `cargo test --workspace --all-targets`, zero compiler warnings.
+2. **Source & Reference Fidelity**: CSS token parity with locked Streamline palette; `Beacon` house-style parity on root docs, `LICENSE`, `NOTICE`, and captures.
+3. **Usability**: Real MCP connection from both `Hermes` and desktop `Antigravity` executing `bootstrap -> ack_rules -> create_trio_project -> lock -> sync -> HOW-IT-WORKS` without manual file hacking.
+4. **Operational Readiness**: Runs under a dedicated unprivileged systemd unit on the local Linux host (`127.0.0.1` / LAN allowlist), clean SQLite backup/restore verified, rollback tested, and `CLEANUP` leaves zero stray build/temp artifacts outside managed dirs.
+
+## 4. Custody, `HOLD_PUSH`, and Cleanup (`L12`, `L13`)
+
+- **Local Git Custody**: Initialized at `/srv/streamline` on the local build host (`git config user.name "[owner]"`, `git config user.email "owner@example.com"`).
+- **`HOLD_PUSH` Enforced Mechanically**: No GitHub remote is configured during build, and `.git/hooks/pre-push` exits nonzero (`HOLD_PUSH active`) until `AUDIT.md` passes, the Streamline logo assets land in `docs/assets/`, `HOW-IT-WORKS.md` is owner-approved, and the owner gives an explicit push command.
+- **Per-Slice `CLEANUP`**: Scratch probes and temporary test DBs run under ephemeral temp dirs removed on exit; `cargo clean` or shared target pruning keeps disk usage well below the `60%` yellow mark.
+
+## 5. Ordered Execution Checklist (`L15`)
+
+| # | Phase | Role | Action | Observable / Evidence | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `C-01` | Preflight | Director | Verify `rustc 1.98.1`, free disk, and initialize `/srv/streamline` with `[owner]` git identity + `pre-push` `HOLD_PUSH` hook | `git log -1` + hook exit check | PENDING |
+| `C-02` | Slice 1 | Worker | Implement `streamline-{core,safe,store,http}` + 4 skills zip + unit/integration tests | `cargo test --workspace` rc 0 | PENDING |
+| `C-03` | Slice 1 | Acceptor | Connect live MCP from local server and desktop clients; execute real `P1` Trio+ lifecycle + negative auth/redaction probes | Captured MCP session transcript | PENDING |
+| `C-04` | Slice 2 | Worker | Implement `streamline-conveyor` (read-only stage, runner, cleanup/scan gate, cross-family QC, JSONL export) | Conveyor e2e test log | PENDING |
+| `C-05` | Slice 3 | Worker | Implement 3-pane Web UI + `presence_plugin_dir` hook + `Beacon`-style README, captures, and `HOW-IT-WORKS.md` | DOM tests + SVG captures | PENDING |
+| `C-06` | Audit | Acceptor | Run 6-phase security audit + secret/identity/IP zero-hit scan across entire git history | `AUDIT.md` + scanner `0/0/0` | PENDING |
+| `C-07` | Closeout | Owner | Supply Streamline logo assets in `docs/assets/`, review `HOW-IT-WORKS.md`, and decide on creating/pushing `Gavinbombay/Streamline` | Owner sign-off | PENDING |
