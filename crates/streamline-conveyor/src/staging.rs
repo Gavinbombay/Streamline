@@ -43,9 +43,9 @@ pub(crate) fn stage_pinned_inputs(
     for entry in entries {
         validate_single_segment(&entry.staged_basename)?;
         if !seen_basenames.insert(entry.staged_basename.as_str()) {
+            let safe_base = crate::runner::sanitize_path_label(&entry.staged_basename);
             return Err(ConveyorError::StageFailure(format!(
-                "duplicate staged input basename '{}'",
-                entry.staged_basename
+                "duplicate staged input basename '{safe_base}'"
             )));
         }
     }
@@ -139,8 +139,9 @@ pub fn stage_readonly_inputs(
         verify_no_symlink_components(&trimmed)?;
         let staged_basename = resolve_input_basename(&trimmed)?;
         if !seen_basenames.insert(staged_basename.clone()) {
+            let safe_base = crate::runner::sanitize_path_label(&staged_basename);
             return Err(ConveyorError::StageFailure(format!(
-                "duplicate staged input basename '{staged_basename}'"
+                "duplicate staged input basename '{safe_base}'"
             )));
         }
 
@@ -267,7 +268,9 @@ pub fn verify_no_symlink_components(path: &Path) -> Result<(), ConveyorError> {
     let trimmed = trim_trailing_slashes_and_dot(path);
     let meta = fs::symlink_metadata(&trimmed).map_err(|err| {
         if err.kind() == io::ErrorKind::NotFound {
-            ConveyorError::MissingInput(path.display().to_string())
+            ConveyorError::MissingInput(crate::runner::sanitize_path_label(
+                &path.display().to_string(),
+            ))
         } else {
             ConveyorError::StageFailure(err.to_string())
         }
@@ -371,13 +374,13 @@ fn open_parent_and_leaf(
     trimmed: &Path,
     display_path: &Path,
 ) -> Result<(PinnedDir, String), ConveyorError> {
+    let safe_disp = crate::runner::sanitize_path_label(&display_path.display().to_string());
     if let (Some(parent), Some(name)) = (trimmed.parent(), trimmed.file_name()) {
         let leaf_name = name
             .to_str()
             .ok_or_else(|| {
                 ConveyorError::StageFailure(format!(
-                    "input path '{}' basename is not valid UTF-8",
-                    display_path.display()
+                    "input path '{safe_disp}' basename is not valid UTF-8"
                 ))
             })?
             .to_string();
@@ -387,35 +390,31 @@ fn open_parent_and_leaf(
             parent
         };
         let parent_dir = PinnedDir::open_existing_dir(parent_ref)
-            .map_err(|e| map_pinned_input_err(e, &display_path.display().to_string()))?;
+            .map_err(|e| map_pinned_input_err(e, &safe_disp))?;
         return Ok((parent_dir, leaf_name));
     }
 
     let canonical = fs::canonicalize(trimmed).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            ConveyorError::MissingInput(display_path.display().to_string())
+            ConveyorError::MissingInput(safe_disp.clone())
         } else {
             ConveyorError::StageFailure(e.to_string())
         }
     })?;
     let parent = canonical.parent().ok_or_else(|| {
-        ConveyorError::StageFailure(format!(
-            "input path '{}' has no parent directory",
-            display_path.display()
-        ))
+        ConveyorError::StageFailure(format!("input path '{safe_disp}' has no parent directory"))
     })?;
     let leaf_name = canonical
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
             ConveyorError::StageFailure(format!(
-                "input path '{}' has no valid UTF-8 basename",
-                display_path.display()
+                "input path '{safe_disp}' has no valid UTF-8 basename"
             ))
         })?
         .to_string();
-    let parent_dir = PinnedDir::open_existing_dir(parent)
-        .map_err(|e| map_pinned_input_err(e, &display_path.display().to_string()))?;
+    let parent_dir =
+        PinnedDir::open_existing_dir(parent).map_err(|e| map_pinned_input_err(e, &safe_disp))?;
     Ok((parent_dir, leaf_name))
 }
 
@@ -483,20 +482,21 @@ fn copy_pinned_file(
     }
     let remaining = MAX_MANIFEST_TOTAL_BYTES.saturating_sub(budget.copied_bytes);
 
+    let safe_src_name = crate::runner::sanitize_path_label(src_name);
     let mut src_file = src_dir
         .open_file_nofollow(src_name)
-        .map_err(|e| map_pinned_input_err(e, src_name))?;
+        .map_err(|e| map_pinned_input_err(e, &safe_src_name))?;
     let src_meta = src_file
         .metadata()
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
     if src_meta.len() > MAX_STAGED_FILE_BYTES as u64 {
         return Err(ConveyorError::StageFailure(format!(
-            "input file '{src_name}' exceeds maximum staged size"
+            "input file '{safe_src_name}' exceeds maximum staged size"
         )));
     }
     if src_meta.len() > remaining as u64 {
         return Err(ConveyorError::StageFailure(format!(
-            "staged input total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{src_name}'"
+            "staged input total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{safe_src_name}'"
         )));
     }
 
@@ -522,12 +522,12 @@ fn copy_pinned_file(
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
     if bytes.len() > MAX_STAGED_FILE_BYTES {
         return Err(ConveyorError::StageFailure(format!(
-            "input file '{src_name}' exceeds maximum staged size"
+            "input file '{safe_src_name}' exceeds maximum staged size"
         )));
     }
     if bytes.len() > remaining {
         return Err(ConveyorError::StageFailure(format!(
-            "staged input total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{src_name}'"
+            "staged input total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{safe_src_name}'"
         )));
     }
 
@@ -614,13 +614,14 @@ fn collect_files_pinned(
                                 .to_string()
                                 .contains("exceeds maximum allowed byte size") =>
                     {
+                        let safe_rel = crate::runner::sanitize_path_label(&rel);
                         if remaining < MAX_MANIFEST_FILE_BYTES {
                             return Err(ConveyorError::StageFailure(format!(
-                                "manifest total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{rel}'"
+                                "manifest total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{safe_rel}'"
                             )));
                         }
                         return Err(ConveyorError::StageFailure(format!(
-                            "manifest file '{rel}' exceeds maximum of {MAX_MANIFEST_FILE_BYTES} bytes"
+                            "manifest file '{safe_rel}' exceeds maximum of {MAX_MANIFEST_FILE_BYTES} bytes"
                         )));
                     }
                     Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
@@ -643,7 +644,7 @@ fn collect_files_pinned(
 
 fn map_pinned_input_err(err: io::Error, path_label: &str) -> ConveyorError {
     if err.kind() == io::ErrorKind::NotFound {
-        ConveyorError::MissingInput(path_label.to_string())
+        ConveyorError::MissingInput(crate::runner::sanitize_path_label(path_label))
     } else {
         ConveyorError::StageFailure(err.to_string())
     }
@@ -657,8 +658,9 @@ fn validate_single_segment(name: &str) -> Result<(), ConveyorError> {
         || name.contains('\\')
         || name.contains('\0')
     {
+        let safe_name = crate::runner::sanitize_path_label(name);
         return Err(ConveyorError::StageFailure(format!(
-            "invalid staged input basename '{name}'"
+            "invalid staged input basename '{safe_name}'"
         )));
     }
     Ok(())
@@ -747,6 +749,7 @@ fn unfreeze_recursive(
 }
 
 fn resolve_input_basename(path: &Path) -> Result<String, ConveyorError> {
+    let safe_disp = crate::runner::sanitize_path_label(&path.display().to_string());
     let os_name = match path.file_name() {
         Some(name) => name.to_os_string(),
         None => {
@@ -756,22 +759,19 @@ fn resolve_input_basename(path: &Path) -> Result<String, ConveyorError> {
                 .file_name()
                 .map(|n| n.to_os_string())
                 .ok_or_else(|| {
-                    ConveyorError::StageFailure(format!(
-                        "input path '{}' has no basename",
-                        path.display()
-                    ))
+                    ConveyorError::StageFailure(format!("input path '{safe_disp}' has no basename"))
                 })?
         }
     };
     let text = os_name.to_str().ok_or_else(|| {
         ConveyorError::StageFailure(format!(
-            "input path '{}' basename is not valid UTF-8",
-            path.display()
+            "input path '{safe_disp}' basename is not valid UTF-8"
         ))
     })?;
     if text.is_empty() || text == "." || text == ".." {
+        let safe_text = crate::runner::sanitize_path_label(text);
         return Err(ConveyorError::StageFailure(format!(
-            "invalid staged input basename '{text}'"
+            "invalid staged input basename '{safe_text}'"
         )));
     }
     Ok(text.to_string())
@@ -813,7 +813,9 @@ fn check_banned(
                     .strip_prefix(root)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| name.to_string());
-                return Err(ConveyorError::DirtyScratch(rel));
+                return Err(ConveyorError::DirtyScratch(
+                    crate::runner::sanitize_path_label(&rel),
+                ));
             }
             check_banned(root, &path, banned, depth + 1, seen_entries)?;
         }

@@ -12,7 +12,7 @@ use streamline_core::{
     assess_work_with_modules, check_sync, AssessmentInput, DivergenceStatus, FreshnessState,
     LifecycleTier, PrincipalRole, SourcePassport, TriageState, WorkKind,
 };
-use streamline_safe::inspect_text;
+use streamline_safe::{inspect_text, RedactionPolicy};
 use streamline_store::{
     compare_texts, AccessGrant, CreateTrioProjectRequest, OwnDecisionInput,
     RecordDivergenceRequest, RecordLessonRequest, RequirementRowInput, ResourceFilter,
@@ -1599,12 +1599,18 @@ fn handle_export_workspace(
     }))
 }
 
-fn map_conveyor_error(err: ConveyorError) -> ApiError {
-    ApiError::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "CONVEYOR_ERROR",
-        err.to_string(),
-    )
+fn map_conveyor_error(err: ConveyorError, policy: &RedactionPolicy) -> ApiError {
+    let raw_msg = err.to_string();
+    let strict_policy = RedactionPolicy {
+        public_safe_mode: true,
+    };
+    let safe_msg = if inspect_text(&raw_msg, policy).ok && inspect_text(&raw_msg, &strict_policy).ok
+    {
+        raw_msg
+    } else {
+        "conveyor execution failed (diagnostic path redacted by policy)".to_string()
+    };
+    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "CONVEYOR_ERROR", safe_msg)
 }
 
 fn handle_dispatch_run(
@@ -1644,8 +1650,8 @@ fn handle_dispatch_run(
         caller_has_wildcard_scope: checked_grant.principal_role == PrincipalRole::Owner
             || checked_grant.granted_tags.iter().any(|tag| tag == "*"),
     };
-    let outcome: DispatchOutcome =
-        execute_conveyor_blocking(&state.config, &req).map_err(map_conveyor_error)?;
+    let outcome: DispatchOutcome = execute_conveyor_blocking(&state.config, &req)
+        .map_err(|err| map_conveyor_error(err, &state.redaction_policy))?;
 
     state.store.upsert_conveyor_run(outcome.build_run.clone())?;
     if let Some(ref accept_run) = outcome.accept_run {
@@ -1709,7 +1715,8 @@ fn export_bundle_trajectory(
         how_it_works_sha256,
     };
 
-    append_trajectory_jsonl(runs_dir, &state.redaction_policy, &input).map_err(map_conveyor_error)
+    append_trajectory_jsonl(runs_dir, &state.redaction_policy, &input)
+        .map_err(|err| map_conveyor_error(err, &state.redaction_policy))
 }
 
 fn handle_export_trajectory(

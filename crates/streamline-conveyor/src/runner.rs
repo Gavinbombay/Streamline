@@ -1510,7 +1510,14 @@ fn format_quota_escalation(
     )
 }
 
-fn sanitize_escalation_path(raw_path: &str, policy: &RedactionPolicy) -> String {
+pub(crate) fn sanitize_path_label(raw_path: &str) -> String {
+    let strict_policy = RedactionPolicy {
+        public_safe_mode: true,
+    };
+    sanitize_escalation_path(raw_path, &strict_policy)
+}
+
+pub(crate) fn sanitize_escalation_path(raw_path: &str, policy: &RedactionPolicy) -> String {
     let strict_policy = RedactionPolicy {
         public_safe_mode: true,
     };

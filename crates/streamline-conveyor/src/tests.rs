@@ -1420,3 +1420,24 @@ fn non_utf8_output_filename_and_binary_prefixed_payload_blocked_before_accept() 
         .unwrap_or_default()
         .contains("REDACTION_SCAN_FAILED"));
 }
+
+#[test]
+fn oversized_staged_input_redacts_sensitive_entry_name_in_error() {
+    let tmp = TempDirGuard::new("conveyor-stage-redact-err");
+    let bundle_dir = tmp.path.join("bundle");
+    fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+
+    let sensitive_name = format!("{}.bin", ["ghp_", "StageLeak123456AbCd"].concat());
+    let big_path = bundle_dir.join(&sensitive_name);
+    let oversized_len = (crate::staging::MAX_MANIFEST_FILE_BYTES + 1024) as u64;
+    let f = fs::File::create(&big_path).expect("create oversized file");
+    f.set_len(oversized_len)
+        .expect("set oversized sparse length");
+
+    let stage_dir = tmp.path.join("stage");
+    let err = stage_readonly_inputs(&[bundle_dir], &stage_dir)
+        .expect_err("oversized descendant input must fail staging");
+    let msg = err.to_string();
+    assert!(msg.contains("redacted-path-"));
+    assert!(!msg.contains("StageLeak123456AbCd"));
+}
