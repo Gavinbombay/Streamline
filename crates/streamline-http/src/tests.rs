@@ -1453,6 +1453,7 @@ async fn http_and_mcp_security_regressions_enforced() {
     let codex_spoof_cred = "cred-sec-codex-s";
     let gemini_acceptor_cred = "cred-sec-gemini-a";
     let scoped_dispatch_cred = "cred-sec-scoped-dispatch";
+    let member_cred = "cred-sec-member";
 
     let owner_grant = seed_grant(
         &state.store,
@@ -1460,6 +1461,14 @@ async fn http_and_mcp_security_regressions_enforced() {
         PrincipalRole::Owner,
         owner_cred,
         vec!["*".to_string()],
+    );
+    let member_grant = seed_grant_with_family(
+        &state.store,
+        "sec-member",
+        PrincipalRole::Member,
+        member_cred,
+        vec!["*".to_string()],
+        Some("human-member"),
     );
     let demo_grant = seed_grant(
         &state.store,
@@ -1508,6 +1517,7 @@ async fn http_and_mcp_security_regressions_enforced() {
         &codex_spoof_grant,
         &gemini_acceptor_grant,
         &scoped_dispatch_grant,
+        &member_grant,
     ] {
         state.store.ack_rules(gid, &rules_sha).unwrap();
     }
@@ -2040,6 +2050,44 @@ async fn http_and_mcp_security_regressions_enforced() {
         assert!(!shelf_body.to_string().contains("required_tag"));
         assert!(!shelf_body.to_string().contains("runbooks"));
     }
+
+    // 10. Member grant claiming actor_is_custodian = true is rejected with 403 FORBIDDEN over REST and MCP.
+    let spoof_custodian_rest = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/update_requirement_stage")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {member_cred}"))
+        .body(Body::from(
+            json!({
+                "project_id": "sec-proj",
+                "req_id": "REQ-01",
+                "target_stage": "L",
+                "evidence_ref": "forged:live",
+                "actor_is_custodian": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (custodian_status, custodian_body) =
+        read_json_body(app.clone().oneshot(spoof_custodian_rest).await.unwrap()).await;
+    assert_eq!(custodian_status, StatusCode::FORBIDDEN);
+    assert_eq!(custodian_body["error"]["code"], "FORBIDDEN");
+
+    let spoof_custodian_mcp = mcp_call(
+        &app,
+        Some(member_cred),
+        230,
+        "update_requirement_stage",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "target_stage": "L",
+            "evidence_ref": "forged:live",
+            "actor_is_custodian": true
+        }),
+    )
+    .await;
+    assert!(parse_mcp_tool_text(&spoof_custodian_mcp).0);
 }
 
 #[cfg(unix)]

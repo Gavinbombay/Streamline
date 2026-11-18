@@ -11,6 +11,6 @@ test tests::stdio_mcp_dispatcher_supports_param_credential_and_notifications ...
 test tests::streamline_safe_blocks_credential_write_with_422_and_zero_persistence ... ok
 test tests::ui_palette_tag_isolation_and_presence_plugin_boundary ... ok
 test tests::ui_renders_interactive_three_pane_tabs_and_triage_controls ... ok
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.21s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.89s
 running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

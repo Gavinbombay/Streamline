@@ -439,8 +439,7 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
                     "req_id": { "type": "string" },
                     "target_stage": { "type": "string", "enum": ["D", "I", "T", "A", "L", "UNKNOWN"] },
                     "evidence_ref": { "type": "string" },
-                    "actor_family": { "type": "string" },
-                    "actor_is_custodian": { "type": "boolean" }
+                    "actor_family": { "type": "string" }
                 },
                 "required": ["project_id", "req_id", "target_stage", "evidence_ref"]
             }),

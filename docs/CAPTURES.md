@@ -9,7 +9,7 @@ Every terminal capture in `docs/captures/` is generated from real loopback test 
 - **Command**: `cargo test --locked -p streamline-http` (filtered to `running`, `test `, and `test result:` lines)
 - **Plain-text transcript**: [`docs/captures/mcp-policy.txt`](captures/mcp-policy.txt)
 - **Rendered SVG**: [`docs/captures/mcp-policy.svg`](captures/mcp-policy.svg)
-- **Text SHA-256**: `88ac41bbfe45ab17ab79b1bf0cec7c3f3182a5230e7877f6a51a8f0270d55fab`
+- **Text SHA-256**: `b6dd80edb6b68467cc5557f2fb10f4b8d29788a65c2ad3d48a7e24d036672a4c`
 - **Scope**: Verifies `/ready`, `/downloads/streamline-skills.zip`, 3-pane Web UI rendering, MCP initialization and tool discovery, tag isolation, stdio MCP notifications, redaction blocking (`422 REDACTION_BLOCKED`), rule acknowledgement (`412 RULES_ACK_REQUIRED` -> `ack_rules`), the 3-part closeout gate, and conveyor trajectory export.
 
 ### 2. Trio+ Conveyor Closeout Gate (`conveyor-closeout`)

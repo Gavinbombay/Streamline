@@ -688,7 +688,14 @@ impl StreamlineStore {
             return Err(StoreError::ForbiddenWrite);
         }
         check_shelf_access_tx(&tx, &grant, "projects", Some(project_id))?;
-        let _ = load_project_tx(&tx, project_id)?;
+        let project = load_project_tx(&tx, project_id)?;
+        if (project.plan_locked_rev.is_some() || project.state == RunState::Done)
+            && grant.principal_role != PrincipalRole::Owner
+        {
+            return Err(StoreError::ForbiddenRole(
+                "only owner can add or edit requirement definitions after plan lock".to_string(),
+            ));
+        }
 
         let trimmed_req_id = req_id.trim();
         let trimmed_source_id = source_id.trim();
@@ -778,6 +785,18 @@ impl StreamlineStore {
 
         let project = load_project_tx(&tx, &req.project_id)?;
         let existing = load_requirement_row_tx(&tx, &req.project_id, &req.req_id)?;
+        if req.actor_is_custodian && grant.principal_role != PrincipalRole::Owner {
+            return Err(StoreError::ForbiddenRole(
+                "caller cannot self-claim custodian authority".to_string(),
+            ));
+        }
+        if (existing.stage == ReqStage::L || project.state == RunState::Done)
+            && grant.principal_role != PrincipalRole::Owner
+        {
+            return Err(StoreError::ForbiddenRole(
+                "only owner can modify requirements after release approval".to_string(),
+            ));
+        }
         let how_it_works_approved =
             project.state == RunState::Done && project.how_it_works_resource_id.is_some();
 
@@ -829,7 +848,7 @@ impl StreamlineStore {
             risk: project.risk,
             actor_principal: grant.principal_id.clone(),
             actor_role: grant.principal_role,
-            actor_is_custodian: req.actor_is_custodian,
+            actor_is_custodian: grant.principal_role == PrincipalRole::Owner,
             builder_principal: existing.builder_principal.clone(),
             builder_family,
             acceptor_family,

@@ -1944,4 +1944,188 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
             ));
         }
     }
+
+    #[test]
+    fn member_cannot_self_claim_custodian_or_mutate_live_requirements() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let worker = seed_agent_grant_with_family(
+            &store,
+            "builder-1",
+            "cred-builder-1",
+            vec!["*".to_string()],
+            Some("openai-codex"),
+        );
+        let acceptor = seed_agent_grant_with_family(
+            &store,
+            "acceptor-1",
+            "cred-acceptor-1",
+            vec!["*".to_string()],
+            Some("google-gemini"),
+        );
+        store
+            .upsert_principal("member-1", "member-1", PrincipalRole::Member)
+            .expect("upsert member");
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        let member = store
+            .create_grant(CreateGrantRequest {
+                grant_id: Some("grant-member-1".to_string()),
+                principal_id: "member-1".to_string(),
+                raw_credential: "cred-member-1".to_string(),
+                granted_tags: vec!["*".to_string()],
+                can_write: true,
+                can_dispatch: false,
+                expires_at: None,
+                model_family: Some("human-member".to_string()),
+            })
+            .expect("create member grant");
+        store
+            .ack_rules(&owner.grant_id, &rules_sha)
+            .expect("ack owner");
+        store
+            .ack_rules(&worker.grant_id, &rules_sha)
+            .expect("ack worker");
+        store
+            .ack_rules(&acceptor.grant_id, &rules_sha)
+            .expect("ack acceptor");
+        store.ack_rules(&member.grant_id, &rules_sha).expect("ack");
+
+        store
+            .create_trio_project(
+                &owner.grant_id,
+                CreateTrioProjectRequest {
+                    project_id: "proj-custodian".to_string(),
+                    create_id: None,
+                    title: "Custodian Guard".to_string(),
+                    assessment: sample_assessment(),
+                    opt_in_modules: vec![],
+                    initial_own_decisions: vec![OwnDecisionInput {
+                        own_id: "OWN-001".to_string(),
+                        statement: "Owner controls Live promotion".to_string(),
+                    }],
+                    initial_requirements: vec![RequirementRowInput {
+                        req_id: "REQ-01".to_string(),
+                        source_id: "OWN-001".to_string(),
+                        statement: "Verify custodian spoofing blocked".to_string(),
+                    }],
+                },
+            )
+            .expect("create project");
+        store
+            .lock_project_plan(&owner.grant_id, "proj-custodian", None)
+            .expect("lock plan");
+
+        let non_owner_def_edit = store.upsert_requirement_row(
+            &member.grant_id,
+            "proj-custodian",
+            "REQ-01",
+            "OWN-001",
+            "Tampered statement after lock",
+        );
+        assert!(matches!(
+            non_owner_def_edit,
+            Err(StoreError::ForbiddenRole(_))
+        ));
+
+        store
+            .update_requirement_stage(
+                &worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-custodian".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::T,
+                    evidence_ref: "test:unit".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("advance to T");
+        store
+            .update_requirement_stage(
+                &acceptor.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-custodian".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::A,
+                    evidence_ref: "qc:ok".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("advance to A");
+
+        let spoof_before_done = store.update_requirement_stage(
+            &member.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-custodian".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::L,
+                evidence_ref: "forged:live".to_string(),
+                actor_family: None,
+                actor_is_custodian: true,
+            },
+        );
+        assert!(matches!(
+            spoof_before_done,
+            Err(StoreError::ForbiddenRole(_))
+        ));
+
+        store
+            .mark_project_cleanup_verified(&owner.grant_id, "proj-custodian", "verified")
+            .expect("cleanup verified");
+        store
+            .record_no_new_lessons(&owner.grant_id, "proj-custodian", "none")
+            .expect("no new lessons");
+        store
+            .submit_how_it_works(
+                &owner.grant_id,
+                "proj-custodian",
+                valid_how_it_works(),
+                None,
+            )
+            .expect("submit how it works");
+        let released = store
+            .approve_release(&owner.grant_id, "proj-custodian")
+            .expect("approve release");
+        assert_eq!(released.requirements[0].stage, ReqStage::L);
+        let orig_evidence = released.requirements[0].evidence_ref.clone();
+
+        let spoof_after_done = store.update_requirement_stage(
+            &member.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-custodian".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::L,
+                evidence_ref: "forged:overwrite".to_string(),
+                actor_family: None,
+                actor_is_custodian: true,
+            },
+        );
+        assert!(matches!(
+            spoof_after_done,
+            Err(StoreError::ForbiddenRole(_))
+        ));
+
+        let demote_after_done = store.update_requirement_stage(
+            &member.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-custodian".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::D,
+                evidence_ref: String::new(),
+                actor_family: None,
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(
+            demote_after_done,
+            Err(StoreError::ForbiddenRole(_))
+        ));
+
+        let bundle_after = store
+            .get_project_bundle(&owner.grant_id, "proj-custodian")
+            .expect("get bundle");
+        assert_eq!(bundle_after.requirements[0].stage, ReqStage::L);
+        assert_eq!(bundle_after.requirements[0].evidence_ref, orig_evidence);
+    }
 }
