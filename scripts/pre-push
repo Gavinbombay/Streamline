@@ -1,9 +1,0 @@
-#!/bin/sh
-set -eu
-
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd))"
-
-if [ ! -f "$REPO_ROOT/AUDIT.md" ] || [ "${STREAMLINE_ALLOW_PUSH:-0}" != "1" ]; then
-    printf '%s\n' "HOLD_PUSH active: verify AUDIT.md, assets, and set STREAMLINE_ALLOW_PUSH=1 before pushing." >&2
-    exit 1
-fi

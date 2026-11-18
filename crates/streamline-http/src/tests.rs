@@ -747,7 +747,7 @@ async fn ui_palette_tag_isolation_and_presence_plugin_boundary() {
         .unwrap();
     assert_eq!(missing_plugin.status(), StatusCode::NOT_FOUND);
 
-    // Scoped agent receives 403 FORBIDDEN on ungranted shelf.
+    // Scoped agent receives 403 FORBIDDEN on ungranted shelf without leaking required_tag.
     let forbidden_req = Request::builder()
         .method(Method::POST)
         .uri("/api/tools/read_resource")
@@ -761,14 +761,26 @@ async fn ui_palette_tag_isolation_and_presence_plugin_boundary() {
         read_json_body(app.oneshot(forbidden_req).await.unwrap()).await;
     assert_eq!(forbidden_status, StatusCode::FORBIDDEN);
     assert_eq!(forbidden_json["error"]["code"], "FORBIDDEN");
+    assert!(forbidden_json["error"]["detail"].is_null());
+    assert!(!forbidden_json.to_string().contains("required_tag"));
+    assert!(!forbidden_json.to_string().contains("runbooks"));
 
-    // 2. Configured presence_plugin_dir serves plugin JS cleanly.
+    // 2. Configured presence_plugin_dir serves plugin JS cleanly when strictly permissioned.
     let plugin_dir = TempDirGuard::new("streamline-presence-plugin");
+    let plugin_js = plugin_dir.path.join("presence.js");
     fs::write(
-        plugin_dir.path.join("presence.js"),
+        &plugin_js,
         "export function mountPresence() { return 'ok'; }\n",
     )
     .expect("write presence.js");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&plugin_dir.path, fs::Permissions::from_mode(0o700))
+            .expect("set strict plugin dir mode");
+        fs::set_permissions(&plugin_js, fs::Permissions::from_mode(0o600))
+            .expect("set strict presence.js mode");
+    }
     let plugin_cfg = StreamlineConfig {
         presence_plugin_dir: plugin_dir.path.display().to_string(),
         ..StreamlineConfig::default()
@@ -806,6 +818,68 @@ async fn ui_palette_tag_isolation_and_presence_plugin_boundary() {
         .await
         .unwrap();
     assert_eq!(plugin_asset.status(), StatusCode::OK);
+
+    // Group/world-writable plugin dir or presence.js must be refused on both GET / and asset route.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for (label, dir_mode, file_mode) in [
+            ("group-writable dir 0o775", 0o775u32, 0o600u32),
+            ("world-writable dir 0o777", 0o777u32, 0o600u32),
+            ("world-writable presence.js 0o666", 0o700u32, 0o666u32),
+        ] {
+            fs::set_permissions(&plugin_dir.path, fs::Permissions::from_mode(dir_mode))
+                .expect("set negative plugin dir mode");
+            fs::set_permissions(&plugin_js, fs::Permissions::from_mode(file_mode))
+                .expect("set negative plugin file mode");
+
+            let neg_cfg = StreamlineConfig {
+                presence_plugin_dir: plugin_dir.path.display().to_string(),
+                ..StreamlineConfig::default()
+            };
+            let neg_app = build_router(make_test_state(neg_cfg));
+
+            let neg_ui = neg_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(neg_ui.status(), StatusCode::OK, "{label}");
+            let neg_html = String::from_utf8(
+                to_bytes(neg_ui.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(
+                !neg_html.contains("/_streamline/presence-plugin/presence.js"),
+                "{label}: GET / must omit presence.js script tag"
+            );
+
+            let neg_asset = neg_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/_streamline/presence-plugin/presence.js")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                neg_asset.status(),
+                StatusCode::NOT_FOUND,
+                "{label}: GET /_streamline/presence-plugin/presence.js must return 404"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1440,7 +1514,7 @@ async fn http_and_mcp_security_regressions_enforced() {
 
     let app = build_router(state);
 
-    // Seed a project:other resource via REST.
+    // Seed a project:other resource and a runbooks resource via REST.
     let seed_other_req = Request::builder()
         .method(Method::POST)
         .uri("/api/tools/save_resource")
@@ -1458,8 +1532,52 @@ async fn http_and_mcp_security_regressions_enforced() {
             .to_string(),
         ))
         .unwrap();
-    let (seed_status, _) = read_json_body(app.clone().oneshot(seed_other_req).await.unwrap()).await;
+    let (seed_status, seed_other_body) =
+        read_json_body(app.clone().oneshot(seed_other_req).await.unwrap()).await;
     assert_eq!(seed_status, StatusCode::OK);
+    let other_resource_id = seed_other_body["data"]["resource"]["id"]
+        .as_str()
+        .expect("other resource id")
+        .to_string();
+
+    let seed_runbook_resp = mcp_call(
+        &app,
+        Some(owner_cred),
+        200,
+        "save_resource",
+        json!({
+            "shelf_slug": "runbooks",
+            "slug": "sec-runbook",
+            "title": "Restricted Runbook",
+            "body_md": "Restricted runbook body.",
+            "summary": "Seed restricted runbook"
+        }),
+    )
+    .await;
+    let (seed_rb_err, seed_rb_data) = parse_mcp_tool_text(&seed_runbook_resp);
+    assert!(!seed_rb_err, "seed runbook failed: {seed_rb_data}");
+    let runbook_resource_id = seed_rb_data["data"]["resource"]["id"]
+        .as_str()
+        .expect("runbook resource id")
+        .to_string();
+
+    for target_id in [&other_resource_id, &runbook_resource_id] {
+        let passport_resp = mcp_call(
+            &app,
+            Some(owner_cred),
+            200,
+            "update_source_passport",
+            json!({
+                "resource_id": target_id,
+                "steward": "owner",
+                "freshness_state": "verified",
+                "lineage_ref": "regression:seed",
+                "next_action": "none"
+            }),
+        )
+        .await;
+        assert!(!parse_mcp_tool_text(&passport_resp).0);
+    }
 
     // 1. project:demo agent overwriting project:other resource must receive 403 FORBIDDEN.
     let hijack_req = Request::builder()
@@ -1835,6 +1953,93 @@ async fn http_and_mcp_security_regressions_enforced() {
         .as_str()
         .unwrap_or_default()
         .contains("INPUT_OUTSIDE_ALLOWED_ROOT"));
+
+    // 8. Restricted resource_id reads and get_source_passport return uniform 404 NOT_FOUND
+    //    across REST and MCP without leaking required_tag or existence oracle signals.
+    for probed_id in [
+        other_resource_id.as_str(),
+        runbook_resource_id.as_str(),
+        "res-nonexistent-0000",
+    ] {
+        for tool_name in ["read_resource", "get_source_passport"] {
+            let rest_req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/tools/{tool_name}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {demo_cred}"))
+                .body(Body::from(json!({ "resource_id": probed_id }).to_string()))
+                .unwrap();
+            let (rest_status, rest_body) =
+                read_json_body(app.clone().oneshot(rest_req).await.unwrap()).await;
+            assert_eq!(rest_status, StatusCode::NOT_FOUND);
+            assert_eq!(rest_body["ok"], false);
+            assert_eq!(rest_body["error"]["code"], "NOT_FOUND");
+            assert!(rest_body["error"]["detail"].is_null());
+            let rest_raw = rest_body.to_string();
+            assert!(!rest_raw.contains("required_tag"));
+            assert!(!rest_raw.contains("project:other"));
+            assert!(!rest_raw.contains("runbooks"));
+
+            let mcp_resp = mcp_call(
+                &app,
+                Some(demo_cred),
+                217,
+                tool_name,
+                json!({ "resource_id": probed_id }),
+            )
+            .await;
+            let (is_err, mcp_body) = parse_mcp_tool_text(&mcp_resp);
+            assert!(is_err);
+            assert_eq!(mcp_resp["result"]["structuredContent"]["status"], 404);
+            assert_eq!(mcp_body["ok"], false);
+            assert_eq!(mcp_body["status"], 404);
+            assert_eq!(mcp_body["error"]["code"], "NOT_FOUND");
+            assert!(mcp_body["error"]["detail"].is_null());
+            let mcp_raw = mcp_body.to_string();
+            assert!(!mcp_raw.contains("required_tag"));
+            assert!(!mcp_raw.contains("project:other"));
+            assert!(!mcp_raw.contains("runbooks"));
+        }
+    }
+
+    // Cross-project slug lookup masks as uniform 404 NOT_FOUND, while ungranted shelf masks
+    // as uniform 403 FORBIDDEN with zero required_tag disclosure.
+    for probed_slug in ["other-bounded", "no-such-slug"] {
+        let proj_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/tools/read_resource")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {demo_cred}"))
+            .body(Body::from(
+                json!({ "shelf_slug": "projects", "slug": probed_slug }).to_string(),
+            ))
+            .unwrap();
+        let (proj_status, proj_body) =
+            read_json_body(app.clone().oneshot(proj_req).await.unwrap()).await;
+        assert_eq!(proj_status, StatusCode::NOT_FOUND);
+        assert_eq!(proj_body["error"]["code"], "NOT_FOUND");
+        assert!(!proj_body.to_string().contains("required_tag"));
+        assert!(!proj_body.to_string().contains("project:other"));
+    }
+
+    for probed_slug in ["sec-runbook", "no-such-slug"] {
+        let shelf_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/tools/read_resource")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {demo_cred}"))
+            .body(Body::from(
+                json!({ "shelf_slug": "runbooks", "slug": probed_slug }).to_string(),
+            ))
+            .unwrap();
+        let (shelf_status, shelf_body) =
+            read_json_body(app.clone().oneshot(shelf_req).await.unwrap()).await;
+        assert_eq!(shelf_status, StatusCode::FORBIDDEN);
+        assert_eq!(shelf_body["error"]["code"], "FORBIDDEN");
+        assert!(shelf_body["error"]["detail"].is_null());
+        assert!(!shelf_body.to_string().contains("required_tag"));
+        assert!(!shelf_body.to_string().contains("runbooks"));
+    }
 }
 
 #[cfg(unix)]
@@ -1873,11 +2078,21 @@ async fn skills_zip_and_presence_plugin_reject_symlinks_and_body_cap_enforced() 
     // 2. Symlinked presence_plugin_dir must not be served and oversized body must hit 413.
     let real_plugin_target = temp.path.join("real-plugin");
     fs::create_dir_all(&real_plugin_target).expect("create real plugin target");
+    let real_plugin_js = real_plugin_target.join("presence.js");
     fs::write(
-        real_plugin_target.join("presence.js"),
+        &real_plugin_js,
         "export function mountPresence() { return 'escape'; }\n",
     )
     .expect("write plugin js");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp.path, fs::Permissions::from_mode(0o700))
+            .expect("set strict temp parent dir mode");
+        fs::set_permissions(&real_plugin_target, fs::Permissions::from_mode(0o700))
+            .expect("set strict real plugin dir mode");
+        fs::set_permissions(&real_plugin_js, fs::Permissions::from_mode(0o600))
+            .expect("set strict real plugin js mode");
+    }
     let symlink_plugin = temp.path.join("plugin-link");
     std::os::unix::fs::symlink(&real_plugin_target, &symlink_plugin)
         .expect("plant plugin dir symlink");
@@ -1902,7 +2117,8 @@ async fn skills_zip_and_presence_plugin_reject_symlinks_and_body_cap_enforced() 
         .unwrap();
     assert_eq!(plugin_resp.status(), StatusCode::NOT_FOUND);
 
-    // Nested symlink inside a real presence_plugin_dir must also return 404 NOT_FOUND.
+    // Nested symlink inside a real presence_plugin_dir must also return 404 NOT_FOUND,
+    // while strictly permissioned presence.js returns 200 OK.
     std::os::unix::fs::symlink(&outside_file, real_plugin_target.join("escape.js"))
         .expect("plant nested plugin symlink");
     let real_plugin_app = build_router(AppState::new(
@@ -1913,6 +2129,19 @@ async fn skills_zip_and_presence_plugin_reject_symlinks_and_body_cap_enforced() 
         },
         skills_root.clone(),
     ));
+    let real_js_resp = real_plugin_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_streamline/presence-plugin/presence.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(real_js_resp.status(), StatusCode::OK);
+
     let nested_symlink_resp = real_plugin_app
         .oneshot(
             Request::builder()

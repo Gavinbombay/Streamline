@@ -9,7 +9,7 @@ Every terminal capture in `docs/captures/` is generated from real loopback test 
 - **Command**: `cargo test --locked -p streamline-http` (filtered to `running`, `test `, and `test result:` lines)
 - **Plain-text transcript**: [`docs/captures/mcp-policy.txt`](captures/mcp-policy.txt)
 - **Rendered SVG**: [`docs/captures/mcp-policy.svg`](captures/mcp-policy.svg)
-- **Text SHA-256**: `cf04c5eb138a90c142a972d7237cd1519cd51f64192747620243753b2904a777`
+- **Text SHA-256**: `99a50c1554fabec80f9a2b9ebb9aeb21f68c45f8b12b7c365ac92b264a8bb7d7`
 - **Scope**: Verifies `/ready`, `/downloads/streamline-skills.zip`, 3-pane Web UI rendering, MCP initialization and tool discovery, tag isolation, stdio MCP notifications, redaction blocking (`422 REDACTION_BLOCKED`), rule acknowledgement (`412 RULES_ACK_REQUIRED` -> `ack_rules`), the 3-part closeout gate, and conveyor trajectory export.
 
 ### 2. Trio+ Conveyor Closeout Gate (`conveyor-closeout`)
@@ -17,7 +17,7 @@ Every terminal capture in `docs/captures/` is generated from real loopback test 
 - **Command**: `cargo test --locked -p streamline-conveyor` (filtered to `running`, `test `, and `test result:` lines)
 - **Plain-text transcript**: [`docs/captures/conveyor-closeout.txt`](captures/conveyor-closeout.txt)
 - **Rendered SVG**: [`docs/captures/conveyor-closeout.svg`](captures/conveyor-closeout.svg)
-- **Text SHA-256**: `7aea89ffdb6cce96ab96208be2b9fab82b5993f200f8cd9bf19f9aef2c5d6b70`
+- **Text SHA-256**: `f53209af763dd52cd593c57234b52e2aa7aa6342dec633e50a219a2395c616f1`
 - **Scope**: Verifies cross-family acceptor enforcement (`R2` and above), read-only staging manifests, two-strike builder impasse escalation, dirty work-tree quarantine, scrubbed environment execution, redaction impasse protection, stray-artifact cleanup checks, and verified JSONL trajectory export.
 
 ## Regenerating Captures

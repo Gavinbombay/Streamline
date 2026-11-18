@@ -147,11 +147,10 @@ impl From<StoreError> for ApiError {
             StoreError::Unauthorized | StoreError::GrantRevoked | StoreError::GrantExpired => {
                 ApiError::new(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", err.to_string())
             }
-            StoreError::ForbiddenTag { ref required_tag } => ApiError::with_detail(
+            StoreError::ForbiddenTag { .. } => ApiError::new(
                 StatusCode::FORBIDDEN,
                 "FORBIDDEN",
-                err.to_string(),
-                json!({ "required_tag": required_tag }),
+                "forbidden: grant does not cover requested scope",
             ),
             StoreError::ForbiddenWrite
             | StoreError::ForbiddenDispatch

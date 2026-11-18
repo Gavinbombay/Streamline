@@ -72,7 +72,8 @@ mod tests {
     use rusqlite::{params, Connection};
     use streamline_core::{
         AssessmentInput, CoreError, DivergenceStatus, FreshnessState, LifecycleTier, PairedSyncRow,
-        PrincipalRole, ReqStage, RunState, SyncVerdict, TriageState, TrioProfile, WorkKind,
+        PrincipalRole, ReqStage, RunState, SourcePassport, SyncVerdict, TriageState, TrioProfile,
+        WorkKind,
     };
 
     use super::*;
@@ -1728,5 +1729,219 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
             fs::read_to_string(&outside_file).expect("read outside"),
             "DO_NOT_READ_OR_OVERWRITE\n"
         );
+    }
+
+    #[test]
+    fn resource_id_and_cross_project_reads_return_uniform_not_found() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        store
+            .ack_rules(&owner.grant_id, &rules_sha)
+            .expect("ack owner");
+
+        let runbook = store
+            .save_resource(
+                &owner.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "runbooks".to_string(),
+                    slug: "deploy-runbook".to_string(),
+                    title: "Deploy Guide".to_string(),
+                    body_md: "Restricted runbook content.".to_string(),
+                    project_id: None,
+                    trio_role: None,
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Seed runbook".to_string(),
+                    expected_rev: None,
+                },
+            )
+            .expect("save runbook");
+
+        let other_proj = store
+            .save_resource(
+                &owner.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "other-doc".to_string(),
+                    title: "Other Project Doc".to_string(),
+                    body_md: "Restricted other project content.".to_string(),
+                    project_id: Some("other".to_string()),
+                    trio_role: None,
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Seed other doc".to_string(),
+                    expected_rev: None,
+                },
+            )
+            .expect("save other project doc");
+
+        let demo_proj = store
+            .save_resource(
+                &owner.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "demo-doc".to_string(),
+                    title: "Demo Project Doc".to_string(),
+                    body_md: "Authorized demo project content.".to_string(),
+                    project_id: Some("demo".to_string()),
+                    trio_role: None,
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Seed demo doc".to_string(),
+                    expected_rev: None,
+                },
+            )
+            .expect("save demo project doc");
+
+        for target_id in [&runbook.resource.id, &other_proj.resource.id] {
+            store
+                .upsert_source_passport(
+                    &owner.grant_id,
+                    SourcePassport {
+                        resource_id: target_id.clone(),
+                        steward: "owner".to_string(),
+                        last_verified_at: "2026-11-18T00:00:00Z".to_string(),
+                        freshness_state: FreshnessState::Verified,
+                        lineage_ref: "seed:test".to_string(),
+                        access_scope: "restricted".to_string(),
+                        next_action: "none".to_string(),
+                    },
+                )
+                .expect("seed passport");
+        }
+
+        let demo_agent = seed_agent_grant(
+            &store,
+            "demo-scoped",
+            "cred-demo-scoped",
+            vec!["project:demo".to_string(), "standards".to_string()],
+        );
+        store
+            .ack_rules(&demo_agent.grant_id, &rules_sha)
+            .expect("ack demo agent");
+
+        let standards_only = seed_agent_grant(
+            &store,
+            "standards-only",
+            "cred-standards-only",
+            vec!["standards".to_string()],
+        );
+        store
+            .ack_rules(&standards_only.grant_id, &rules_sha)
+            .expect("ack standards agent");
+
+        // Authorized resource_id succeeds.
+        assert_eq!(
+            store
+                .read_resource_by_id(&demo_agent.grant_id, &demo_proj.resource.id)
+                .expect("demo read allowed")
+                .resource
+                .slug,
+            "demo-doc"
+        );
+
+        // Restricted resource_id lookups mask identically to missing resource_id.
+        for probed_id in [
+            runbook.resource.id.as_str(),
+            other_proj.resource.id.as_str(),
+            "res-nonexistent-0000",
+        ] {
+            let expected_msg = format!("resource '{probed_id}' not found");
+            assert!(matches!(
+                store.read_resource_by_id(&demo_agent.grant_id, probed_id),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+            assert!(matches!(
+                store.get_source_passport(&demo_agent.grant_id, probed_id),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+            assert!(matches!(
+                store.upsert_source_passport(
+                    &demo_agent.grant_id,
+                    SourcePassport {
+                        resource_id: probed_id.to_string(),
+                        steward: "probe".to_string(),
+                        last_verified_at: "2026-11-18T00:00:00Z".to_string(),
+                        freshness_state: FreshnessState::Unknown,
+                        lineage_ref: "probe".to_string(),
+                        access_scope: "probe".to_string(),
+                        next_action: "probe".to_string(),
+                    },
+                ),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+        }
+
+        // Ungranted shelves return ForbiddenTag uniformly regardless of slug existence.
+        for probed_slug in ["deploy-runbook", "no-such-slug"] {
+            assert!(matches!(
+                store.read_resource(&demo_agent.grant_id, "runbooks", probed_slug),
+                Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "runbooks"
+            ));
+            assert!(matches!(
+                store.resource_history(&demo_agent.grant_id, "runbooks", probed_slug),
+                Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "runbooks"
+            ));
+            assert!(matches!(
+                store.compare_revisions(&demo_agent.grant_id, "runbooks", probed_slug, 1, 1),
+                Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "runbooks"
+            ));
+            assert!(matches!(
+                store.restore_resource(&demo_agent.grant_id, "runbooks", probed_slug, 1, None),
+                Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "runbooks"
+            ));
+            assert!(matches!(
+                store.set_lifecycle_tier(
+                    &demo_agent.grant_id,
+                    "runbooks",
+                    probed_slug,
+                    LifecycleTier::Dormant,
+                    None,
+                    None,
+                ),
+                Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "runbooks"
+            ));
+        }
+
+        // Caller with zero project:* tags gets uniform ForbiddenTag on projects shelf.
+        for probed_slug in ["other-doc", "no-such-slug"] {
+            assert!(matches!(
+                store.read_resource(&standards_only.grant_id, "projects", probed_slug),
+                Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "projects"
+            ));
+        }
+
+        // Caller with project:demo gets uniform NotFound on other project slugs and missing slugs.
+        for probed_slug in ["other-doc", "no-such-slug"] {
+            let expected_msg = format!("resource 'projects/{probed_slug}' not found");
+            assert!(matches!(
+                store.read_resource(&demo_agent.grant_id, "projects", probed_slug),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+            assert!(matches!(
+                store.resource_history(&demo_agent.grant_id, "projects", probed_slug),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+            assert!(matches!(
+                store.compare_revisions(&demo_agent.grant_id, "projects", probed_slug, 1, 1),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+            assert!(matches!(
+                store.restore_resource(&demo_agent.grant_id, "projects", probed_slug, 1, None),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+            assert!(matches!(
+                store.set_lifecycle_tier(
+                    &demo_agent.grant_id,
+                    "projects",
+                    probed_slug,
+                    LifecycleTier::Dormant,
+                    None,
+                    None,
+                ),
+                Err(StoreError::NotFound(ref msg)) if msg == &expected_msg
+            ));
+        }
     }
 }

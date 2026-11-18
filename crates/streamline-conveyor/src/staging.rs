@@ -10,7 +10,10 @@ use streamline_safe::PinnedDir;
 use crate::error::ConveyorError;
 
 const BANNED_SCRATCH_DIRS: [&str; 5] = ["target", ".venv", "venv", "node_modules", "__pycache__"];
-const MAX_STAGED_FILE_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_MANIFEST_FILES: usize = crate::runner::MAX_OUTPUT_FILES;
+pub const MAX_MANIFEST_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MANIFEST_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STAGED_FILE_BYTES: usize = MAX_MANIFEST_FILE_BYTES;
 
 /// Deterministic SHA-256 manifest for a staged input or output directory tree.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +72,7 @@ pub(crate) fn stage_pinned_inputs(
         .open_or_create_subdir("INPUTS", 0o755)
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 
+    let mut copy_budget = StageCopyBudget::default();
     for entry in entries {
         match entry.parent_dir.is_regular_file_nofollow(&entry.leaf_name) {
             Ok(true) => {
@@ -77,6 +81,7 @@ pub(crate) fn stage_pinned_inputs(
                     &entry.leaf_name,
                     &inputs_fd,
                     &entry.staged_basename,
+                    &mut copy_budget,
                 )?;
             }
             Ok(false) => {
@@ -87,7 +92,7 @@ pub(crate) fn stage_pinned_inputs(
                 let sub_dst = inputs_fd
                     .open_or_create_subdir(&entry.staged_basename, 0o755)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                copy_pinned_dir_recursive(&sub_src, &sub_dst)?;
+                copy_pinned_dir_recursive(&sub_src, &sub_dst, &mut copy_budget)?;
             }
             Err(err) => return Err(map_pinned_input_err(err, &entry.leaf_name)),
         }
@@ -351,16 +356,23 @@ fn open_parent_and_leaf(
     Ok((parent_dir, leaf_name))
 }
 
+#[derive(Default)]
+struct StageCopyBudget {
+    copied_files: usize,
+    copied_bytes: usize,
+}
+
 fn copy_pinned_dir_recursive(
     src_dir: &PinnedDir,
     dst_dir: &PinnedDir,
+    budget: &mut StageCopyBudget,
 ) -> Result<(), ConveyorError> {
     let child_names = src_dir
         .list_entry_names()
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
     for child in child_names {
         match src_dir.is_regular_file_nofollow(&child) {
-            Ok(true) => copy_pinned_file(src_dir, &child, dst_dir, &child)?,
+            Ok(true) => copy_pinned_file(src_dir, &child, dst_dir, &child, budget)?,
             Ok(false) => {
                 let sub_src = src_dir
                     .open_subdir(&child)
@@ -368,7 +380,7 @@ fn copy_pinned_dir_recursive(
                 let sub_dst = dst_dir
                     .open_or_create_subdir(&child, 0o755)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                copy_pinned_dir_recursive(&sub_src, &sub_dst)?;
+                copy_pinned_dir_recursive(&sub_src, &sub_dst, budget)?;
             }
             Err(err) => return Err(map_pinned_input_err(err, &child)),
         }
@@ -381,7 +393,15 @@ fn copy_pinned_file(
     src_name: &str,
     dst_dir: &PinnedDir,
     dst_name: &str,
+    budget: &mut StageCopyBudget,
 ) -> Result<(), ConveyorError> {
+    if budget.copied_files >= MAX_MANIFEST_FILES {
+        return Err(ConveyorError::StageFailure(format!(
+            "staged input file count exceeds maximum of {MAX_MANIFEST_FILES} files"
+        )));
+    }
+    let remaining = MAX_MANIFEST_TOTAL_BYTES.saturating_sub(budget.copied_bytes);
+
     let mut src_file = src_dir
         .open_file_nofollow(src_name)
         .map_err(|e| map_pinned_input_err(e, src_name))?;
@@ -391,6 +411,11 @@ fn copy_pinned_file(
     if src_meta.len() > MAX_STAGED_FILE_BYTES as u64 {
         return Err(ConveyorError::StageFailure(format!(
             "input file '{src_name}' exceeds maximum staged size"
+        )));
+    }
+    if src_meta.len() > remaining as u64 {
+        return Err(ConveyorError::StageFailure(format!(
+            "staged input total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{src_name}'"
         )));
     }
 
@@ -406,13 +431,12 @@ fn copy_pinned_file(
     #[cfg(not(unix))]
     let file_mode = 0o644;
 
-    let cap = usize::try_from(src_meta.len())
-        .unwrap_or(0)
-        .min(MAX_STAGED_FILE_BYTES);
+    let read_cap = MAX_STAGED_FILE_BYTES.min(remaining);
+    let cap = usize::try_from(src_meta.len()).unwrap_or(0).min(read_cap);
     let mut bytes = Vec::with_capacity(cap);
     src_file
         .by_ref()
-        .take((MAX_STAGED_FILE_BYTES as u64).saturating_add(1))
+        .take((read_cap as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
     if bytes.len() > MAX_STAGED_FILE_BYTES {
@@ -420,19 +444,35 @@ fn copy_pinned_file(
             "input file '{src_name}' exceeds maximum staged size"
         )));
     }
+    if bytes.len() > remaining {
+        return Err(ConveyorError::StageFailure(format!(
+            "staged input total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{src_name}'"
+        )));
+    }
+
+    budget.copied_files += 1;
+    budget.copied_bytes = budget.copied_bytes.saturating_add(bytes.len());
 
     dst_dir
         .atomic_write_nofollow(dst_name, &bytes, file_mode)
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))
 }
 
+struct ManifestAccumulator {
+    entries: Vec<(String, String)>,
+    total_bytes: usize,
+}
+
 fn compute_pinned_manifest(root_fd: &PinnedDir) -> Result<StagedManifest, ConveyorError> {
-    let mut entries = Vec::new();
-    collect_files_pinned(root_fd, "", &mut entries)?;
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut acc = ManifestAccumulator {
+        entries: Vec::new(),
+        total_bytes: 0,
+    };
+    collect_files_pinned(root_fd, "", &mut acc)?;
+    acc.entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut combined = Sha256::new();
-    for (rel, digest) in &entries {
+    for (rel, digest) in &acc.entries {
         combined.update(digest.as_bytes());
         combined.update(b"  ");
         combined.update(rel.as_bytes());
@@ -441,15 +481,15 @@ fn compute_pinned_manifest(root_fd: &PinnedDir) -> Result<StagedManifest, Convey
 
     Ok(StagedManifest {
         manifest_sha256: hex::encode(combined.finalize()),
-        file_count: entries.len(),
-        entries,
+        file_count: acc.entries.len(),
+        entries: acc.entries,
     })
 }
 
 fn collect_files_pinned(
     dir_fd: &PinnedDir,
     prefix: &str,
-    out: &mut Vec<(String, String)>,
+    acc: &mut ManifestAccumulator,
 ) -> Result<(), ConveyorError> {
     let names = dir_fd
         .list_entry_names()
@@ -465,17 +505,41 @@ fn collect_files_pinned(
         };
         match dir_fd.is_regular_file_nofollow(&name) {
             Ok(true) => {
-                let bytes = dir_fd
-                    .read_bytes_nofollow(&name, MAX_STAGED_FILE_BYTES)
-                    .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+                if acc.entries.len() >= MAX_MANIFEST_FILES {
+                    return Err(ConveyorError::StageFailure(format!(
+                        "manifest file count exceeds maximum of {MAX_MANIFEST_FILES} files"
+                    )));
+                }
+                let remaining = MAX_MANIFEST_TOTAL_BYTES.saturating_sub(acc.total_bytes);
+                let per_file_limit = MAX_MANIFEST_FILE_BYTES.min(remaining);
+                let bytes = match dir_fd.read_bytes_nofollow(&name, per_file_limit) {
+                    Ok(bytes) => bytes,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::InvalidInput
+                            && err
+                                .to_string()
+                                .contains("exceeds maximum allowed byte size") =>
+                    {
+                        if remaining < MAX_MANIFEST_FILE_BYTES {
+                            return Err(ConveyorError::StageFailure(format!(
+                                "manifest total size exceeds maximum of {MAX_MANIFEST_TOTAL_BYTES} bytes at '{rel}'"
+                            )));
+                        }
+                        return Err(ConveyorError::StageFailure(format!(
+                            "manifest file '{rel}' exceeds maximum of {MAX_MANIFEST_FILE_BYTES} bytes"
+                        )));
+                    }
+                    Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
+                };
+                acc.total_bytes = acc.total_bytes.saturating_add(bytes.len());
                 let digest = hex::encode(Sha256::digest(&bytes));
-                out.push((rel, digest));
+                acc.entries.push((rel, digest));
             }
             Ok(false) => {
                 let sub_fd = dir_fd
                     .open_subdir(&name)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                collect_files_pinned(&sub_fd, &rel, out)?;
+                collect_files_pinned(&sub_fd, &rel, acc)?;
             }
             Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
         }

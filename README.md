@@ -23,8 +23,9 @@ Streamline grew out of running multiple AI assistants across real engineering pr
 ## Features
 
 - **Mechanical rule gate (`bootstrap` -> `ack_rules`)**: Write and workflow tools return `412 Precondition Failed` (`RULES_ACK_REQUIRED`) until the caller acknowledges the current `rules_sha256` digest. Updating rules automatically re-locks active grants until re-acknowledged.
-- **Tag-scoped grants and fenced legacy shelves**: Issue SHA-256-hashed credentials scoped by shelf tags, write permission, and dispatch permission. `bootstrap` surfaces `active` items only, keeping imported `dormant` and `legacy` records searchable and revivable without polluting agent startup context.
+- **Tag-scoped grants, uniform `404` isolation, and fenced legacy shelves**: Issue SHA-256-hashed credentials scoped by shelf tags, write permission, and dispatch permission. `read_resource` (`resource_id`), `get_source_passport`, and cross-project slug lookups return uniform `404 NOT_FOUND` without loading bodies or disclosing required tag names, and `403 FORBIDDEN` responses omit `required_tag` details. `bootstrap` surfaces `active` items only, keeping imported `dormant` and `legacy` records searchable and revivable without polluting agent startup context.
 - **High-entropy redaction gate (`streamline-safe`)**: Blocks PEM private blocks, credential prefixes, raw bearer strings, high-entropy literals, disallowed dashes, and private LAN literals (in `public_safe_mode`) with `422 REDACTION_BLOCKED` before any bytes are persisted.
+- **Unix-only descriptor pinning and bounded conveyor scanning**: Compiles on Unix targets only (`#[cfg(unix)]`, `compile_error!` on non-Unix) so `PinnedDir` (`openat`, `fstatat`, `mkdirat`, `renameat`, `O_NOFOLLOW`) has zero path-based fallback. `PinnedDir` walks configured vault, run, input, and plugin directories from `/` (or `.`) with `O_NOFOLLOW`, verifying ownership by `geteuid()` or `root` (`uid 0`) and rejecting world-writable paths (plus rejecting group-writable `0o022` paths on `presence_plugin_dir` and its assets). Operators must still keep configured data roots on trusted local filesystems protected from concurrent untrusted modification. Harness output scanning enforces `512` files, `4 MiB` per file, `16 MiB` aggregate bytes, and `64` findings, stopping at `Impasse` (`OUTPUT_QUOTA_EXCEEDED`) when exceeded.
 - **Scalable Trio+ engine (`P0` to `P4`)**: Scores Difficulty (`D0` to `D4`) and Risk (`R0` to `R4`) to select the right document set, freezes owner `OWN` decisions on `lock_project_plan` (`409 OWN_LOCKED` on worker mutation), tracks requirements across `D -> I -> T -> A -> L`, and pairs plan rows against as-built reports (`check_sync`).
 - **Two-way Obsidian markdown sync and central lessons**: Keeps append-only SQLite revisions in step with plain `.md` files on disk (`vault_sync_dir`), and surfaces tagged `lessons_learned` records automatically in `bootstrap` and `query_lessons`.
 - **Three-pane Web UI + portable skill bundle**: Serves a dark-palette three-pane workspace (`/`), an optional local `Presence` plugin slot (`/_streamline/presence-plugin/`), and `/downloads/streamline-skills.zip` (`streamline-director`, `streamline-worker`, `streamline-acceptor`, `streamline-vault`).
@@ -64,9 +65,9 @@ Streamline is organized as a Cargo workspace with five focused crates under a si
 ```text
 streamline (src/main.rs: serve | mcp-stdio | init-grant | import-legacy | sync-vault)
   ├── crates/streamline-core     Domain models, P0..P4 Trio+ planner, OWN lock rules, D I T A L checks
-  ├── crates/streamline-safe     Redaction engine, private-IP filter, dash guard, path sanitizer
+  ├── crates/streamline-safe     Redaction engine, private-IP filter, dash guard, root-walked PinnedDir (Unix-only)
   ├── crates/streamline-store    Single SQLite writer (rusqlite), append-only revisions, Obsidian vault sync
-  ├── crates/streamline-conveyor Scoped read-only staging, 2-strike runner, cleanup quarantine, cross-family guard, JSONL trajectories
+  ├── crates/streamline-conveyor Scoped 0444/0555 staging, 2-strike runner, cleanup quarantine, bounded output scan, cross-family guard, JSONL trajectories
   └── crates/streamline-http     Axum router, Streamable HTTP + stdio MCP handler, REST tools, 3-pane Web UI
 ```
 
@@ -128,7 +129,7 @@ When placing Streamline behind a reverse proxy on an edge host (for example `192
 - Keep `bind_http = "127.0.0.1:5880"` so Streamline never listens directly on public interfaces.
 - Forward `Authorization` and `X-Streamline-Credential` headers unchanged to `/mcp` and `/api/tools/*`.
 - Disable response buffering on `/mcp` so JSON-RPC responses return immediately.
-- Leave `public_safe_mode = true` whenever external clients or public-safe repositories share the instance, and keep `presence_plugin_dir` empty unless loading private local brand assets from disk.
+- Leave `public_safe_mode = true` whenever external clients or public-safe repositories share the instance, keep configured data roots on trusted local filesystems protected from concurrent untrusted modification, and keep `presence_plugin_dir` empty unless loading private local brand assets owned by `geteuid()` or `root` (`uid 0`) with zero group/world write bits (`0o022 == 0`).
 
 ## How the Trio+ referee and conveyor work
 
@@ -141,13 +142,15 @@ For a complete non-technical walkthrough, see [`HOW-IT-WORKS.md`](HOW-IT-WORKS.m
 
 ## Build
 
-Run the repeatable verification suite from the repository root:
+Streamline compiles on Unix targets only (`#[cfg(unix)]`). Run the repeatable verification suite and maintainer dependency checks from the repository root:
 
 ```sh
 sh ./check-toolchain.sh
 cargo fmt --all -- --check
 cargo test --locked --workspace --all-targets
 cargo build --locked --release
+cargo audit
+cargo deny check advisories bans licenses sources
 ```
 
 ## License

@@ -59,18 +59,6 @@ pub fn append_trajectory_jsonl(
         return Err(ConveyorError::RedactionBlocked(summary));
     }
 
-    if let Some(parent) = runs_dir.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Ok(parent_meta) = std::fs::symlink_metadata(parent) {
-                if parent_meta.file_type().is_symlink() {
-                    return Err(ConveyorError::StageFailure(
-                        "refusing to write trajectory under symlinked parent directory".to_string(),
-                    ));
-                }
-            }
-        }
-    }
-
     let runs_fd = PinnedDir::open_or_create_dir(runs_dir)
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 

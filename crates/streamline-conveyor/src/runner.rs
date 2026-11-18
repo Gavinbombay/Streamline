@@ -17,6 +17,10 @@ use crate::staging::{
 };
 
 const SAFE_ENV_VARS: [&str; 4] = ["PATH", "HOME", "TMPDIR", "LANG"];
+pub const MAX_OUTPUT_FILES: usize = 512;
+pub const MAX_SINGLE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_TOTAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_SCAN_FINDINGS: usize = 64;
 
 /// Request parameters for a blocking hands-off conveyor dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,6 +66,12 @@ struct OutputScanFinding {
     line: usize,
     kind: ViolationKind,
     reason: String,
+}
+
+enum OutputScanOutcome {
+    Clean,
+    Violations(Vec<OutputScanFinding>),
+    QuotaExceeded(String),
 }
 
 /// Validates that an independent acceptance pass for R2+ work uses a distinct model family.
@@ -112,9 +122,12 @@ pub fn execute_conveyor_blocking(
     let work_dir = run_dir.join("work");
     let out_dir = run_dir.join("out");
 
-    fs::create_dir_all(&stage_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-    fs::create_dir_all(&work_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-    fs::create_dir_all(&out_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    PinnedDir::open_or_create_dir(&stage_dir)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    PinnedDir::open_or_create_dir(&work_dir)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    PinnedDir::open_or_create_dir(&out_dir)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 
     let ctx = RunContext {
         config,
@@ -319,39 +332,40 @@ fn execute_conveyor_inner(ctx: &RunContext<'_>) -> Result<DispatchOutcome, Conve
     let policy = RedactionPolicy {
         public_safe_mode: ctx.config.public_safe_mode,
     };
-    let findings = scan_utf8_outputs(&ctx.out_dir, &policy)?;
-    if !findings.is_empty() {
-        let escalation = format_redaction_escalation(
-            &ctx.req.project_id,
-            &ctx.build_run_id,
-            "build",
-            &ctx.builder.id,
-            &ctx.builder.family,
-            &findings,
-        );
-        fs::write(ctx.out_dir.join("ESCALATION.md"), escalation.as_bytes())
-            .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-        let out_manifest = compute_tree_manifest(&ctx.out_dir)?;
-        let build_run = ConveyorRun {
-            run_id: ctx.build_run_id.clone(),
-            project_id: ctx.req.project_id.clone(),
-            phase: RunPhase::Build,
-            harness_id: ctx.builder.id.clone(),
-            family: ctx.builder.family.clone(),
-            input_manifest_sha256: staged_manifest.manifest_sha256,
-            output_manifest_sha256: out_manifest.manifest_sha256,
-            cleanup_clean: true,
-            scan_clean: false,
-            state: RunState::Impasse,
-            started_at: ctx.build_started_at.clone(),
-            finished_at: Some(utc_now_rfc3339()),
-        };
-        return Ok(DispatchOutcome {
-            build_run,
-            accept_run: None,
-            final_state: RunState::Impasse,
-            escalation_markdown: Some(escalation),
-        });
+    match scan_utf8_outputs(&ctx.out_dir, &policy)? {
+        OutputScanOutcome::Clean => {}
+        OutputScanOutcome::Violations(findings) => {
+            let escalation = format_redaction_escalation(
+                &ctx.req.project_id,
+                &ctx.build_run_id,
+                "build",
+                &ctx.builder.id,
+                &ctx.builder.family,
+                &findings,
+            );
+            return record_build_scan_impasse(
+                ctx,
+                &staged_manifest.manifest_sha256,
+                escalation,
+                false,
+            );
+        }
+        OutputScanOutcome::QuotaExceeded(reason) => {
+            let escalation = format_quota_escalation(
+                &ctx.req.project_id,
+                &ctx.build_run_id,
+                "build",
+                &ctx.builder.id,
+                &ctx.builder.family,
+                &reason,
+            );
+            return record_build_scan_impasse(
+                ctx,
+                &staged_manifest.manifest_sha256,
+                escalation,
+                true,
+            );
+        }
     }
 
     let build_out_manifest = compute_tree_manifest(&ctx.out_dir)?;
@@ -926,8 +940,7 @@ fn record_input_rejection_impasse(
          {detail}\n",
         ctx.req.project_id, ctx.build_run_id, ctx.builder.id, ctx.builder.family
     );
-    fs::write(ctx.out_dir.join("ESCALATION.md"), escalation.as_bytes())
-        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    write_escalation_file(&ctx.out_dir, &escalation)?;
     let out_manifest = compute_tree_manifest(&ctx.out_dir)?;
     let build_run = ConveyorRun {
         run_id: ctx.build_run_id.clone(),
@@ -974,8 +987,7 @@ fn record_two_strike_impasse(
         format_exit_status(status1),
         format_exit_status(status2),
     );
-    fs::write(ctx.out_dir.join("ESCALATION.md"), escalation.as_bytes())
-        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    write_escalation_file(&ctx.out_dir, &escalation)?;
     let out_manifest = compute_tree_manifest(&ctx.out_dir)?;
     let cleanup_clean = verify_cleanup_clean(&ctx.work_dir).is_ok();
     let build_run = ConveyorRun {
@@ -1008,8 +1020,10 @@ fn run_acceptance_pass(
 ) -> Result<DispatchOutcome, ConveyorError> {
     let work_accept_dir = ctx.run_dir.join("work_accept");
     let out_accept_dir = ctx.run_dir.join("out_accept");
-    fs::create_dir_all(&work_accept_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-    fs::create_dir_all(&out_accept_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    PinnedDir::open_or_create_dir(&work_accept_dir)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    PinnedDir::open_or_create_dir(&out_accept_dir)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 
     // Freeze builder outputs read-only during acceptance so acceptor cannot mutate them.
     freeze_readonly_tree(&ctx.out_dir)?;
@@ -1046,11 +1060,13 @@ fn run_acceptance_pass(
             acceptor.family,
             format_exit_status(accept_status),
         );
-        fs::write(out_accept_dir.join("ESCALATION.md"), escalation.as_bytes())
-            .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        write_escalation_file(&out_accept_dir, &escalation)?;
         let cleanup_clean = verify_cleanup_clean(&work_accept_dir).is_ok();
-        let scan_clean = scan_utf8_outputs(&out_accept_dir, policy)?.is_empty();
-        let out_accept_manifest = compute_tree_manifest(&out_accept_dir)?;
+        let scan_clean = matches!(
+            scan_utf8_outputs(&out_accept_dir, policy)?,
+            OutputScanOutcome::Clean
+        );
+        let out_accept_manifest_sha256 = compute_output_manifest_sha256(&out_accept_dir, true)?;
         let accept_run = ConveyorRun {
             run_id: accept_run_id,
             project_id: ctx.req.project_id.clone(),
@@ -1058,7 +1074,7 @@ fn run_acceptance_pass(
             harness_id: acceptor.id.clone(),
             family: acceptor.family.clone(),
             input_manifest_sha256: build_run.output_manifest_sha256.clone(),
-            output_manifest_sha256: out_accept_manifest.manifest_sha256,
+            output_manifest_sha256: out_accept_manifest_sha256,
             cleanup_clean,
             scan_clean,
             state: RunState::Impasse,
@@ -1106,39 +1122,48 @@ fn run_acceptance_pass(
         Err(other) => return Err(other),
     }
 
-    let findings = scan_utf8_outputs(&out_accept_dir, policy)?;
-    if !findings.is_empty() {
-        let escalation = format_redaction_escalation(
-            &ctx.req.project_id,
-            &accept_run_id,
-            "accept",
-            &acceptor.id,
-            &acceptor.family,
-            &findings,
-        );
-        fs::write(out_accept_dir.join("ESCALATION.md"), escalation.as_bytes())
-            .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-        let out_accept_manifest = compute_tree_manifest(&out_accept_dir)?;
-        let accept_run = ConveyorRun {
-            run_id: accept_run_id,
-            project_id: ctx.req.project_id.clone(),
-            phase: RunPhase::Accept,
-            harness_id: acceptor.id.clone(),
-            family: acceptor.family.clone(),
-            input_manifest_sha256: build_run.output_manifest_sha256.clone(),
-            output_manifest_sha256: out_accept_manifest.manifest_sha256,
-            cleanup_clean: true,
-            scan_clean: false,
-            state: RunState::Impasse,
-            started_at: accept_started_at,
-            finished_at: Some(utc_now_rfc3339()),
-        };
-        return Ok(DispatchOutcome {
-            build_run,
-            accept_run: Some(accept_run),
-            final_state: RunState::Impasse,
-            escalation_markdown: Some(escalation),
-        });
+    match scan_utf8_outputs(&out_accept_dir, policy)? {
+        OutputScanOutcome::Clean => {}
+        OutputScanOutcome::Violations(findings) => {
+            let escalation = format_redaction_escalation(
+                &ctx.req.project_id,
+                &accept_run_id,
+                "accept",
+                &acceptor.id,
+                &acceptor.family,
+                &findings,
+            );
+            return record_accept_scan_impasse(
+                ctx,
+                build_run,
+                accept_run_id,
+                accept_started_at,
+                acceptor,
+                &out_accept_dir,
+                escalation,
+                false,
+            );
+        }
+        OutputScanOutcome::QuotaExceeded(reason) => {
+            let escalation = format_quota_escalation(
+                &ctx.req.project_id,
+                &accept_run_id,
+                "accept",
+                &acceptor.id,
+                &acceptor.family,
+                &reason,
+            );
+            return record_accept_scan_impasse(
+                ctx,
+                build_run,
+                accept_run_id,
+                accept_started_at,
+                acceptor,
+                &out_accept_dir,
+                escalation,
+                true,
+            );
+        }
     }
 
     let out_accept_manifest = compute_tree_manifest(&out_accept_dir)?;
@@ -1192,67 +1217,231 @@ fn run_harness_command(
     Ok(output.status)
 }
 
+#[derive(Default)]
+struct OutputScanState {
+    seen_files: usize,
+    total_bytes: usize,
+    findings: Vec<OutputScanFinding>,
+}
+
 fn scan_utf8_outputs(
     out_dir: &Path,
     policy: &RedactionPolicy,
-) -> Result<Vec<OutputScanFinding>, ConveyorError> {
-    let mut files = Vec::new();
-    collect_regular_files(out_dir, &mut files)?;
-    files.sort();
+) -> Result<OutputScanOutcome, ConveyorError> {
+    let root_fd = match PinnedDir::open_existing_dir(out_dir) {
+        Ok(fd) => fd,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(OutputScanOutcome::Clean),
+        Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
+    };
 
-    let mut findings = Vec::new();
-    for file_path in files {
-        let bytes = fs::read(&file_path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        let report = inspect_text(text, policy);
-        if !report.ok {
-            let rel_path = file_path
-                .strip_prefix(out_dir)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| file_path.display().to_string());
-            for violation in report.violations {
-                findings.push(OutputScanFinding {
-                    rel_path: rel_path.clone(),
-                    line: violation.line,
-                    kind: violation.kind,
-                    reason: violation.reason,
-                });
-            }
-        }
+    let mut state = OutputScanState::default();
+    if let Some(quota_reason) = scan_pinned_dir(&root_fd, "", policy, &mut state)? {
+        return Ok(OutputScanOutcome::QuotaExceeded(quota_reason));
     }
-    Ok(findings)
+    if !state.findings.is_empty() {
+        return Ok(OutputScanOutcome::Violations(state.findings));
+    }
+    Ok(OutputScanOutcome::Clean)
 }
 
-fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ConveyorError> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    let rd = fs::read_dir(dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-    let mut entries: Vec<PathBuf> = Vec::new();
-    for entry in rd {
-        let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-        entries.push(entry.path());
-    }
-    entries.sort();
+fn scan_pinned_dir(
+    dir_fd: &PinnedDir,
+    prefix: &str,
+    policy: &RedactionPolicy,
+    state: &mut OutputScanState,
+) -> Result<Option<String>, ConveyorError> {
+    let names = dir_fd
+        .list_entry_names()
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 
-    for path in entries {
-        let link_meta =
-            fs::symlink_metadata(&path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-        let ft = link_meta.file_type();
-        if ft.is_symlink() {
-            return Err(ConveyorError::StageFailure(
-                "symlinks are forbidden in harness output directories".to_string(),
-            ));
-        }
-        if ft.is_dir() {
-            collect_regular_files(&path, out)?;
-        } else if ft.is_file() {
-            out.push(path);
+    for name in names {
+        let rel_path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        match dir_fd.is_regular_file_nofollow(&name) {
+            Ok(true) => {
+                if state.seen_files >= MAX_OUTPUT_FILES {
+                    return Ok(Some(format!(
+                        "output file count exceeded maximum budget of {MAX_OUTPUT_FILES} files"
+                    )));
+                }
+                state.seen_files += 1;
+
+                let remaining = MAX_TOTAL_OUTPUT_BYTES.saturating_sub(state.total_bytes);
+                let per_file_limit = MAX_SINGLE_OUTPUT_BYTES.min(remaining);
+                let bytes = match dir_fd.read_bytes_nofollow(&name, per_file_limit) {
+                    Ok(bytes) => bytes,
+                    Err(err)
+                        if err.kind() == io::ErrorKind::InvalidInput
+                            && err
+                                .to_string()
+                                .contains("exceeds maximum allowed byte size") =>
+                    {
+                        let reason = if remaining < MAX_SINGLE_OUTPUT_BYTES {
+                            format!(
+                                "total output bytes exceeded maximum budget of {MAX_TOTAL_OUTPUT_BYTES} bytes at '{rel_path}'"
+                            )
+                        } else {
+                            format!(
+                                "output file '{rel_path}' exceeded single-file budget of {MAX_SINGLE_OUTPUT_BYTES} bytes"
+                            )
+                        };
+                        return Ok(Some(reason));
+                    }
+                    Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
+                };
+                state.total_bytes = state.total_bytes.saturating_add(bytes.len());
+
+                if state.findings.len() < MAX_SCAN_FINDINGS {
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        let report = inspect_text(text, policy);
+                        if !report.ok {
+                            for violation in report.violations {
+                                if state.findings.len() >= MAX_SCAN_FINDINGS {
+                                    break;
+                                }
+                                state.findings.push(OutputScanFinding {
+                                    rel_path: rel_path.clone(),
+                                    line: violation.line,
+                                    kind: violation.kind,
+                                    reason: violation.reason,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false) => {
+                let sub_fd = dir_fd
+                    .open_subdir(&name)
+                    .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+                if let Some(reason) = scan_pinned_dir(&sub_fd, &rel_path, policy, state)? {
+                    return Ok(Some(reason));
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::InvalidInput => {
+                return Err(ConveyorError::StageFailure(
+                    "symlinks are forbidden in harness output directories".to_string(),
+                ));
+            }
+            Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
         }
     }
-    Ok(())
+
+    Ok(None)
+}
+
+fn write_escalation_file(out_dir: &Path, escalation: &str) -> Result<(), ConveyorError> {
+    let out_fd = PinnedDir::open_existing_dir(out_dir)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    out_fd
+        .atomic_write_nofollow("ESCALATION.md", escalation.as_bytes(), 0o644)
+        .map_err(|e| ConveyorError::StageFailure(e.to_string()))
+}
+
+fn compute_output_manifest_sha256(
+    out_dir: &Path,
+    allow_quota_empty: bool,
+) -> Result<String, ConveyorError> {
+    match compute_tree_manifest(out_dir) {
+        Ok(manifest) => Ok(manifest.manifest_sha256),
+        Err(ConveyorError::StageFailure(msg))
+            if allow_quota_empty && msg.contains("exceeds maximum") =>
+        {
+            Ok(String::new())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn record_build_scan_impasse(
+    ctx: &RunContext<'_>,
+    input_manifest_sha256: &str,
+    escalation: String,
+    allow_quota_empty: bool,
+) -> Result<DispatchOutcome, ConveyorError> {
+    write_escalation_file(&ctx.out_dir, &escalation)?;
+    let out_manifest_sha256 = compute_output_manifest_sha256(&ctx.out_dir, allow_quota_empty)?;
+    let build_run = ConveyorRun {
+        run_id: ctx.build_run_id.clone(),
+        project_id: ctx.req.project_id.clone(),
+        phase: RunPhase::Build,
+        harness_id: ctx.builder.id.clone(),
+        family: ctx.builder.family.clone(),
+        input_manifest_sha256: input_manifest_sha256.to_string(),
+        output_manifest_sha256: out_manifest_sha256,
+        cleanup_clean: true,
+        scan_clean: false,
+        state: RunState::Impasse,
+        started_at: ctx.build_started_at.clone(),
+        finished_at: Some(utc_now_rfc3339()),
+    };
+    Ok(DispatchOutcome {
+        build_run,
+        accept_run: None,
+        final_state: RunState::Impasse,
+        escalation_markdown: Some(escalation),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_accept_scan_impasse(
+    ctx: &RunContext<'_>,
+    build_run: ConveyorRun,
+    accept_run_id: String,
+    accept_started_at: String,
+    acceptor: &HarnessSpec,
+    out_accept_dir: &Path,
+    escalation: String,
+    allow_quota_empty: bool,
+) -> Result<DispatchOutcome, ConveyorError> {
+    write_escalation_file(out_accept_dir, &escalation)?;
+    let out_accept_manifest_sha256 =
+        compute_output_manifest_sha256(out_accept_dir, allow_quota_empty)?;
+    let accept_run = ConveyorRun {
+        run_id: accept_run_id,
+        project_id: ctx.req.project_id.clone(),
+        phase: RunPhase::Accept,
+        harness_id: acceptor.id.clone(),
+        family: acceptor.family.clone(),
+        input_manifest_sha256: build_run.output_manifest_sha256.clone(),
+        output_manifest_sha256: out_accept_manifest_sha256,
+        cleanup_clean: true,
+        scan_clean: false,
+        state: RunState::Impasse,
+        started_at: accept_started_at,
+        finished_at: Some(utc_now_rfc3339()),
+    };
+    Ok(DispatchOutcome {
+        build_run,
+        accept_run: Some(accept_run),
+        final_state: RunState::Impasse,
+        escalation_markdown: Some(escalation),
+    })
+}
+
+fn format_quota_escalation(
+    project_id: &str,
+    run_id: &str,
+    phase: &str,
+    harness_id: &str,
+    family: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "# Conveyor Escalation Report\n\n\
+         - Reason: `OUTPUT_QUOTA_EXCEEDED`\n\
+         - Project ID: `{project_id}`\n\
+         - Run ID: `{run_id}`\n\
+         - Phase: `{phase}`\n\
+         - Harness: `{harness_id}` (`{family}`)\n\
+         - Detail: {reason}\n\n\
+         Harness output exceeded safety scan budgets (max files: {MAX_OUTPUT_FILES}, \
+         max single file: {MAX_SINGLE_OUTPUT_BYTES} bytes, max total: {MAX_TOTAL_OUTPUT_BYTES} bytes). \
+         Escalated to impasse.\n"
+    )
 }
 
 fn format_redaction_escalation(

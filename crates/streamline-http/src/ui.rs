@@ -2049,11 +2049,18 @@ pub async fn index_handler(
         "Private Local Mode"
     };
     let active_panel = normalize_panel(query.panel.as_deref());
-    let has_presence_plugin = state
+    let has_presence_plugin = match state
         .config
         .presence_plugin_path()
-        .map(crate::is_verified_real_dir)
-        .unwrap_or(false);
+        .map(std::path::Path::to_path_buf)
+    {
+        Some(plugin_dir) => {
+            tokio::task::spawn_blocking(move || crate::is_verified_presence_plugin(&plugin_dir))
+                .await
+                .unwrap_or(false)
+        }
+        None => false,
+    };
     let presence_script_tag = if has_presence_plugin {
         r#"<script type="module" src="/_streamline/presence-plugin/presence.js"></script>"#
     } else {

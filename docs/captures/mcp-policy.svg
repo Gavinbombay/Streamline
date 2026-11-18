@@ -31,7 +31,7 @@
   <text x="24" y="268" class="code highlight">test tests::streamline_safe_blocks_credential_write_with_422_and_zero_persistence ... ok</text>
   <text x="24" y="288" class="code highlight">test tests::ui_palette_tag_isolation_and_presence_plugin_boundary ... ok</text>
   <text x="24" y="308" class="code highlight">test tests::ui_renders_interactive_three_pane_tabs_and_triage_controls ... ok</text>
-  <text x="24" y="328" class="code highlight">test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.39s</text>
+  <text x="24" y="328" class="code highlight">test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.99s</text>
   <text x="24" y="348" class="code">running 0 tests</text>
   <text x="24" y="368" class="code highlight">test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s</text>
 </svg>

@@ -1061,3 +1061,183 @@ fn intermediate_symlink_under_allowed_root_is_rejected() {
         assert!(!run_dir.join("work").join("ran.flag").exists());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn trajectory_export_refuses_intermediate_symlinked_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDirGuard::new("conveyor-traj-anc-symlink");
+    let outside = tmp.path.join("outside");
+    let existing_nested = outside.join("nested");
+    fs::create_dir_all(&existing_nested).expect("create outside/nested");
+
+    let ancestor_link = tmp.path.join("ancestor_link");
+    symlink(&outside, &ancestor_link).expect("create ancestor_link");
+
+    let policy = RedactionPolicy {
+        public_safe_mode: true,
+    };
+    let input = TrajectoryExportInput {
+        project_id: "proj-anc-symlink".to_string(),
+        title: "Ancestor Symlink Guard".to_string(),
+        profile: TrioProfile::P1,
+        own_statements: vec!["OWN-001: Ancestor guard".to_string()],
+        div_summaries: vec![],
+        lesson_rules: vec![],
+        sync_verdict: Some(SyncVerdict::Pass),
+        how_it_works_sha256: None,
+    };
+
+    let runs_under_existing = ancestor_link.join("nested").join("runs");
+    let err_existing = append_trajectory_jsonl(&runs_under_existing, &policy, &input)
+        .expect_err("intermediate symlinked ancestor must fail");
+    assert!(matches!(err_existing, ConveyorError::StageFailure(_)));
+    assert!(!existing_nested.join("runs").exists());
+
+    let runs_under_missing = ancestor_link.join("uncreated").join("runs");
+    let err_missing = append_trajectory_jsonl(&runs_under_missing, &policy, &input)
+        .expect_err("missing nested dir under symlinked ancestor must fail");
+    assert!(matches!(err_missing, ConveyorError::StageFailure(_)));
+    assert!(!outside.join("uncreated").exists());
+}
+
+#[test]
+fn oversized_harness_output_records_quota_impasse() {
+    let tmp = TempDirGuard::new("conveyor-oversized-out");
+    let spec_path = tmp.path.join("spec.md");
+    fs::write(&spec_path, "Input\n").expect("write spec.md");
+
+    let builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "dd if=/dev/zero of=\"$STREAMLINE_OUT_DIR/big.bin\" bs=1048576 count=5 2>/dev/null",
+    );
+    let acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
+
+    let runs_dir = tmp.path.join("runs");
+    let cfg = base_config(&runs_dir, vec![builder, acceptor]);
+    let req = DispatchRequest {
+        project_id: "proj-oversized-out".to_string(),
+        input_paths: vec![spec_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+
+    let outcome = execute_conveyor_blocking(&cfg, &req).expect("oversized output returns Impasse");
+    assert_eq!(outcome.final_state, RunState::Impasse);
+    assert_eq!(outcome.build_run.state, RunState::Impasse);
+    assert!(!outcome.build_run.scan_clean);
+    assert!(outcome.accept_run.is_none());
+
+    let escalation = outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("escalation markdown present");
+    assert!(escalation.contains("OUTPUT_QUOTA_EXCEEDED"));
+
+    let escalation_path = runs_dir
+        .join(&outcome.build_run.run_id)
+        .join("out")
+        .join("ESCALATION.md");
+    assert_eq!(
+        fs::read_to_string(escalation_path).expect("read ESCALATION.md"),
+        *escalation
+    );
+}
+
+#[test]
+fn too_many_output_files_records_quota_impasse() {
+    let tmp = TempDirGuard::new("conveyor-too-many-out");
+    let spec_path = tmp.path.join("spec.md");
+    fs::write(&spec_path, "Input\n").expect("write spec.md");
+
+    let builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "i=1
+         while [ \"$i\" -le 513 ]; do
+             : > \"$STREAMLINE_OUT_DIR/f_$i.txt\"
+             i=$((i + 1))
+         done",
+    );
+    let acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
+
+    let runs_dir = tmp.path.join("runs");
+    let cfg = base_config(&runs_dir, vec![builder, acceptor]);
+    let req = DispatchRequest {
+        project_id: "proj-many-files".to_string(),
+        input_paths: vec![spec_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+
+    let outcome =
+        execute_conveyor_blocking(&cfg, &req).expect("too many output files returns Impasse");
+    assert_eq!(outcome.final_state, RunState::Impasse);
+    assert_eq!(outcome.build_run.state, RunState::Impasse);
+    assert!(!outcome.build_run.scan_clean);
+    assert!(outcome.accept_run.is_none());
+
+    let escalation = outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("escalation markdown present");
+    assert!(escalation.contains("OUTPUT_QUOTA_EXCEEDED"));
+}
+
+#[test]
+fn redaction_scan_caps_findings_at_max_scan_findings() {
+    let tmp = TempDirGuard::new("conveyor-cap-findings");
+    let spec_path = tmp.path.join("spec.md");
+    fs::write(&spec_path, "Input\n").expect("write spec.md");
+
+    let leaked_sample = ["ghp_", "AbCdEf123456GhIj"].concat();
+    let script = format!(
+        "i=1; while [ \"$i\" -le 100 ]; do printf '%s\\n' '{leaked_sample}' >> \"$STREAMLINE_OUT_DIR/noisy.txt\"; i=$((i + 1)); done"
+    );
+    let builder = sh_harness("codex-main", "openai-codex", &script);
+    let acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
+
+    let runs_dir = tmp.path.join("runs");
+    let cfg = base_config(&runs_dir, vec![builder, acceptor]);
+    let req = DispatchRequest {
+        project_id: "proj-cap-findings".to_string(),
+        input_paths: vec![spec_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+
+    let outcome = execute_conveyor_blocking(&cfg, &req).expect("capped findings returns Impasse");
+    assert_eq!(outcome.final_state, RunState::Impasse);
+    assert!(!outcome.build_run.scan_clean);
+
+    let escalation = outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("escalation markdown present");
+    assert!(escalation.contains("REDACTION_SCAN_FAILED"));
+    let finding_lines = escalation
+        .lines()
+        .filter(|line| line.starts_with("- `noisy.txt` "))
+        .count();
+    assert_eq!(finding_lines, crate::runner::MAX_SCAN_FINDINGS);
+}
+
+#[test]
+fn compute_tree_manifest_enforces_file_count_limit() {
+    let tmp = TempDirGuard::new("conveyor-manifest-cap");
+    for idx in 0..=crate::staging::MAX_MANIFEST_FILES {
+        fs::write(tmp.path.join(format!("item_{idx:04}.txt")), b"x").expect("write manifest file");
+    }
+
+    let err = compute_tree_manifest(&tmp.path)
+        .expect_err("compute_tree_manifest must reject > MAX_MANIFEST_FILES");
+    assert!(matches!(err, ConveyorError::StageFailure(msg) if msg.contains("exceeds maximum")));
+}

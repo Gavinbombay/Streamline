@@ -316,6 +316,80 @@ fn can_read_resource_row(
     )
 }
 
+fn check_shelf_entry_gate_tx(
+    conn: &Connection,
+    grant: &AccessGrant,
+    shelf_slug: &str,
+) -> Result<(), StoreError> {
+    let required_tag: String = conn
+        .query_row(
+            "SELECT required_tag FROM shelves WHERE slug = ?1",
+            params![shelf_slug],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("shelf '{shelf_slug}' not found")))?;
+
+    if grant_has_tag_access(grant, shelf_slug, &required_tag, None) {
+        return Ok(());
+    }
+
+    if shelf_slug == "projects"
+        && grant
+            .granted_tags
+            .iter()
+            .any(|t| t.starts_with("project:") && t.len() > "project:".len())
+    {
+        return Ok(());
+    }
+
+    Err(StoreError::ForbiddenTag { required_tag })
+}
+
+fn verify_shelf_resource_access_tx(
+    conn: &Connection,
+    grant: &AccessGrant,
+    shelf_slug: &str,
+    slug: &str,
+    project_id: Option<&str>,
+) -> Result<(), StoreError> {
+    match check_shelf_access_tx(conn, grant, shelf_slug, project_id) {
+        Ok(()) => Ok(()),
+        Err(StoreError::ForbiddenTag { .. }) => Err(StoreError::NotFound(format!(
+            "resource '{shelf_slug}/{slug}' not found"
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
+fn authorize_resource_by_id_tx(
+    conn: &Connection,
+    grant: &AccessGrant,
+    resource_id: &str,
+) -> Result<(), StoreError> {
+    let scope: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT shelf_slug, project_id FROM resources WHERE id = ?1 AND deleted_at IS NULL",
+            params![resource_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    let Some((shelf_slug, project_id)) = scope else {
+        return Err(StoreError::NotFound(format!(
+            "resource '{resource_id}' not found"
+        )));
+    };
+
+    match check_shelf_access_tx(conn, grant, &shelf_slug, project_id.as_deref()) {
+        Ok(()) => Ok(()),
+        Err(StoreError::ForbiddenTag { .. }) => Err(StoreError::NotFound(format!(
+            "resource '{resource_id}' not found"
+        ))),
+        Err(other) => Err(other),
+    }
+}
+
 fn compute_lcs_diff<T: PartialEq + Clone>(left: &[T], right: &[T]) -> Vec<(i8, T)> {
     let n = left.len();
     let m = right.len();
@@ -728,27 +802,21 @@ impl StreamlineStore {
     ) -> Result<ResourceWithPassport, StoreError> {
         let conn = self.lock_conn()?;
         let grant = load_active_grant_tx(&conn, grant_id)?;
+        check_shelf_entry_gate_tx(&conn, &grant, shelf_slug)?;
 
-        let resource_id_and_project: Option<(String, Option<String>)> = conn
+        let (resource_id, project_id): (String, Option<String>) = conn
             .query_row(
                 "SELECT id, project_id FROM resources
                  WHERE shelf_slug = ?1 AND slug = ?2 AND deleted_at IS NULL",
                 params![shelf_slug, slug],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?;
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("resource '{shelf_slug}/{slug}' not found"))
+            })?;
 
-        let (resource_id, project_id) = match resource_id_and_project {
-            Some(found) => found,
-            None => {
-                check_shelf_access_tx(&conn, &grant, shelf_slug, None)?;
-                return Err(StoreError::NotFound(format!(
-                    "resource '{shelf_slug}/{slug}' not found"
-                )));
-            }
-        };
-
-        check_shelf_access_tx(&conn, &grant, shelf_slug, project_id.as_deref())?;
+        verify_shelf_resource_access_tx(&conn, &grant, shelf_slug, slug, project_id.as_deref())?;
         read_resource_by_id_tx(&conn, &resource_id)
     }
 
@@ -760,14 +828,8 @@ impl StreamlineStore {
     ) -> Result<ResourceWithPassport, StoreError> {
         let conn = self.lock_conn()?;
         let grant = load_active_grant_tx(&conn, grant_id)?;
-        let full = read_resource_by_id_tx(&conn, resource_id)?;
-        check_shelf_access_tx(
-            &conn,
-            &grant,
-            &full.resource.shelf_slug,
-            full.resource.project_id.as_deref(),
-        )?;
-        Ok(full)
+        authorize_resource_by_id_tx(&conn, &grant, resource_id)?;
+        read_resource_by_id_tx(&conn, resource_id)
     }
 
     /// Full-text substring search across authorized resources and current revisions.
@@ -836,6 +898,8 @@ impl StreamlineStore {
     ) -> Result<Vec<ResourceRevision>, StoreError> {
         let conn = self.lock_conn()?;
         let grant = load_active_grant_tx(&conn, grant_id)?;
+        check_shelf_entry_gate_tx(&conn, &grant, shelf_slug)?;
+
         let (resource_id, project_id): (String, Option<String>) = conn
             .query_row(
                 "SELECT id, project_id FROM resources WHERE shelf_slug = ?1 AND slug = ?2",
@@ -847,7 +911,7 @@ impl StreamlineStore {
                 StoreError::NotFound(format!("resource '{shelf_slug}/{slug}' not found"))
             })?;
 
-        check_shelf_access_tx(&conn, &grant, shelf_slug, project_id.as_deref())?;
+        verify_shelf_resource_access_tx(&conn, &grant, shelf_slug, slug, project_id.as_deref())?;
 
         let mut stmt = conn.prepare(
             "SELECT resource_id, rev, body_md, sha256, author_principal, summary, created_at
@@ -887,6 +951,7 @@ impl StreamlineStore {
         if !grant.can_write {
             return Err(StoreError::ForbiddenWrite);
         }
+        check_shelf_entry_gate_tx(&tx, &grant, shelf_slug)?;
 
         let res = tx
             .query_row(
@@ -901,7 +966,7 @@ impl StreamlineStore {
                 StoreError::NotFound(format!("resource '{shelf_slug}/{slug}' not found"))
             })?;
 
-        check_shelf_access_tx(&tx, &grant, shelf_slug, res.project_id.as_deref())?;
+        verify_shelf_resource_access_tx(&tx, &grant, shelf_slug, slug, res.project_id.as_deref())?;
 
         let target_body: String = tx
             .query_row(
@@ -948,6 +1013,8 @@ impl StreamlineStore {
     ) -> Result<RevisionDiffSummary, StoreError> {
         let conn = self.lock_conn()?;
         let grant = load_active_grant_tx(&conn, grant_id)?;
+        check_shelf_entry_gate_tx(&conn, &grant, shelf_slug)?;
+
         let (resource_id, project_id): (String, Option<String>) = conn
             .query_row(
                 "SELECT id, project_id FROM resources WHERE shelf_slug = ?1 AND slug = ?2",
@@ -958,7 +1025,7 @@ impl StreamlineStore {
             .ok_or_else(|| {
                 StoreError::NotFound(format!("resource '{shelf_slug}/{slug}' not found"))
             })?;
-        check_shelf_access_tx(&conn, &grant, shelf_slug, project_id.as_deref())?;
+        verify_shelf_resource_access_tx(&conn, &grant, shelf_slug, slug, project_id.as_deref())?;
 
         let left_body: String = conn
             .query_row(
@@ -994,17 +1061,7 @@ impl StreamlineStore {
             return Err(StoreError::ForbiddenWrite);
         }
 
-        let (shelf_slug, project_id): (String, Option<String>) = tx
-            .query_row(
-                "SELECT shelf_slug, project_id FROM resources WHERE id = ?1",
-                params![passport.resource_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                StoreError::NotFound(format!("resource '{}' not found", passport.resource_id))
-            })?;
-        check_shelf_access_tx(&tx, &grant, &shelf_slug, project_id.as_deref())?;
+        authorize_resource_by_id_tx(&tx, &grant, &passport.resource_id)?;
 
         tx.execute(
             "INSERT INTO source_passports (
@@ -1050,15 +1107,7 @@ impl StreamlineStore {
     ) -> Result<Option<SourcePassport>, StoreError> {
         let conn = self.lock_conn()?;
         let grant = load_active_grant_tx(&conn, grant_id)?;
-        let (shelf_slug, project_id): (String, Option<String>) = conn
-            .query_row(
-                "SELECT shelf_slug, project_id FROM resources WHERE id = ?1",
-                params![resource_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::NotFound(format!("resource '{resource_id}' not found")))?;
-        check_shelf_access_tx(&conn, &grant, &shelf_slug, project_id.as_deref())?;
+        authorize_resource_by_id_tx(&conn, &grant, resource_id)?;
         load_passport_tx(&conn, resource_id)
     }
 
@@ -1078,6 +1127,7 @@ impl StreamlineStore {
         if !grant.can_write {
             return Err(StoreError::ForbiddenWrite);
         }
+        check_shelf_entry_gate_tx(&tx, &grant, shelf_slug)?;
 
         let prev = tx
             .query_row(
@@ -1092,7 +1142,7 @@ impl StreamlineStore {
                 StoreError::NotFound(format!("resource '{shelf_slug}/{slug}' not found"))
             })?;
 
-        check_shelf_access_tx(&tx, &grant, shelf_slug, prev.project_id.as_deref())?;
+        verify_shelf_resource_access_tx(&tx, &grant, shelf_slug, slug, prev.project_id.as_deref())?;
         let clean_target_project_id = match target_project_id {
             Some(raw_pid) => {
                 let clean = validate_slug(&raw_pid, "target_project_id")?;

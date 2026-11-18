@@ -23,7 +23,11 @@ pub use state::AppState;
 pub use tools::{tools_list, McpToolDescriptor, ReadyStatus};
 
 pub(crate) fn is_verified_real_dir(path: &std::path::Path) -> bool {
-    streamline_safe::PinnedDir::open_existing_dir(path).is_ok()
+    streamline_safe::PinnedDir::open_existing_dir_strict(path).is_ok()
+}
+
+pub(crate) fn is_verified_presence_plugin(plugin_dir: &std::path::Path) -> bool {
+    load_verified_plugin_asset(plugin_dir, "presence.js").is_some()
 }
 
 fn plugin_content_type(asset_path: &std::path::Path) -> &'static str {
@@ -60,11 +64,11 @@ fn load_verified_plugin_asset(
         return None;
     }
     let (leaf, parents) = segments.split_last()?;
-    let mut dir = streamline_safe::PinnedDir::open_existing_dir(plugin_dir).ok()?;
+    let mut dir = streamline_safe::PinnedDir::open_existing_dir_strict(plugin_dir).ok()?;
     for seg in parents {
-        dir = dir.open_subdir(seg).ok()?;
+        dir = dir.open_subdir_strict(seg).ok()?;
     }
-    let bytes = dir.read_bytes_nofollow(leaf, 4 * 1024 * 1024).ok()?;
+    let bytes = dir.read_bytes_nofollow_strict(leaf, 4 * 1024 * 1024).ok()?;
     Some((plugin_content_type(std::path::Path::new(leaf)), bytes))
 }
 
@@ -86,7 +90,7 @@ pub fn build_router(state: AppState) -> Router {
         } else {
             tracing::warn!(
                 path = %plugin_dir.display(),
-                "ignoring presence_plugin_dir because it is missing, a symlink, or not a directory"
+                "ignoring presence_plugin_dir because it is missing, a symlink, not a directory, or fails strict ownership/permission checks"
             );
         }
     }

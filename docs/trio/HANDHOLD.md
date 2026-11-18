@@ -38,7 +38,7 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 | `REQ-13` | `OWN-004` | `/downloads/streamline-skills.zip` serves validated `director`, `worker`, `acceptor`, and `vault` skills | Archive byte & PKZIP CRC check | X | X | X | X | X |
 | `REQ-14` | `OWN-005` | 3-pane Web UI preserves exact Streamline dark palette, `16px`/`14px` floors, `44px` targets, and expanded word diffs | DOM/CSS assertion suite | X | X | X | X | X |
 | `REQ-15` | `OWN-006` | Open-source UI renders default status mark while loading private Presence canvas only when `presence_plugin_dir` is configured | Plugin mount isolation test | X | X | X | X | X |
-| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, optional `scripts/pre-push` release-hygiene hook, and `AUDIT.md` PASS | Hygiene scan `0/0/0`; optional local `scripts/pre-push` hook (`HOLD_PUSH`); Git host protections configured separately | X | X | X | | |
+| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, and `AUDIT.md` PASS prior to manual owner publication | Hygiene scan `0/0/0`; `AUDIT.md` PASS verified before manual owner push to `main`; Git host protections configured on remote | X | X | X | | |
 | `REQ-17` | `OWN-011` | Closeout enforces verified temp cleanup (`mark_project_cleanup_verified`), forward lessons in the central `lessons_learned` DB (`record_lesson` / `query_lessons`), and plain-English non-technical `HOW-IT-WORKS.md` approval | Store + MCP closeout gate + `3` live central lessons | X | X | X | X | X |
 
 ## 3. Four-Gate Independent Acceptance (`L10`)
@@ -48,20 +48,20 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 3. **Usability**: Real MCP connection from both `Hermes` and desktop `Antigravity` executing `bootstrap -> ack_rules -> create_trio_project -> lock -> sync -> HOW-IT-WORKS` without manual file hacking.
 4. **Operational Readiness**: Runs under a dedicated unprivileged systemd unit on the local Linux host (`127.0.0.1` / LAN allowlist), clean SQLite backup/restore verified, rollback tested, and `CLEANUP` leaves zero stray build/temp artifacts outside managed dirs.
 
-## 4. Custody, `HOLD_PUSH`, and Cleanup (`L12`, `L13`)
+## 4. Custody and Cleanup (`L12`, `L13`)
 
-- **Local Git Custody**: Initialized in the local repository (`git config user.name "[owner]"`, `git config user.email "owner@example.com"`).
-- **Optional `HOLD_PUSH` Release-Hygiene Hook (`scripts/pre-push`)**: No GitHub remote is configured during build. Maintainers may enable the committed `scripts/pre-push` hook locally (`git config core.hooksPath scripts`), which exits nonzero (`HOLD_PUSH active`) until `AUDIT.md` exists at the repository root and `STREAMLINE_ALLOW_PUSH=1` is set explicitly. This local hook is an optional maintainer release-hygiene convenience, NOT a runtime security boundary or server-enforced control; repository hosting branch and tag protections must be configured independently on the Git host.
+- **Local Git Custody**: Initialized in the local repository with authoring identity `[owner] <owner@example.com>` (`git config user.name "[owner]"`, `git config user.email "owner@example.com"`).
+- **Manual Owner Publication**: No GitHub remote is configured during local build. Publication is the repository owner's separate manual post-landing step after `AUDIT.md` passes clean (push to `main` without force, make the repository public, and set repository description, topics, social preview, and Git host branch/tag protections manually). This repository includes no client-side push hook or automated publishing workflow.
 - **Per-Slice `CLEANUP`**: Scratch probes and temporary test DBs run under ephemeral temp dirs removed on exit; `cargo clean` or shared target pruning keeps disk usage well below the `60%` yellow mark.
 
 ## 5. Ordered Execution Checklist (`L15`)
 
 | # | Phase | Role | Action | Observable / Evidence | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `C-01` | Preflight | Director | Verify `rustc 1.98.1`, free disk, and initialize the local repository with `[owner]` git identity + `scripts/pre-push` `HOLD_PUSH` release-hygiene hook | Commit `b853154d0b60` + hook exit check | PASS |
+| `C-01` | Preflight | Director | Verify `rustc 1.98.1`, free disk, and initialize the local repository with `[owner] <owner@example.com>` git authoring identity | Commit `b853154d0b60` + local git config check | PASS |
 | `C-02` | Slice 1 | Worker | Implement `streamline-{core,safe,store,http}` + 4 skills zip + unit/integration tests | `cargo test --workspace` `30/30` rc `0` + Clippy `0` | PASS |
 | `C-03` | Slice 1 | Acceptor | Connect live MCP; execute real `P1` Trio+ lifecycle, `2,933`-item legacy import, `bootstrap` fencing, central lessons, and skills zip verification | Live loopback MCP e2e (`200`, `0` temp files left) | PASS |
 | `C-04` | Slice 2 | Worker | Implement `streamline-conveyor` (read-only stage, runner, cleanup/scan gate, cross-family QC, JSONL export) | `12/12` conveyor e2e tests (`conveyor-closeout.svg`) | PASS |
 | `C-05` | Slice 3 | Worker | Implement 3-pane Web UI + `presence_plugin_dir` hook + `Beacon`-style README, captures, and `HOW-IT-WORKS.md` | `10/10` HTTP/UI tests (`mcp-policy.svg`), `streamline.service` active, `cargo clean` `2.6 GiB` freed | PASS |
-| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` (`Codex Luna`) + zero-hit scan right before GitHub push; configure Git host branch/tag protections independently of local `scripts/pre-push` | Parked until owner triggers GitHub push | PARKED |
+| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` + zero-hit scan to produce `AUDIT.md` PASS prior to the owner's manual GitHub push and remote branch/tag protection setup | Parked until owner performs manual publication after `AUDIT.md` passes | PARKED |
 | `C-07` | Closeout | Owner | Review plain-English `HOW-IT-WORKS.md` (`DOC-PENDING-OWNER`); later supply logo assets and decide on GitHub push | Owner approved `HOW-IT-WORKS.md` (`2026-11-18`) | PASS |
