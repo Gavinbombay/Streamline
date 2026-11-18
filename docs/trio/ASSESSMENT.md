@@ -14,7 +14,7 @@ Profile: `P2` (`V1.md`, `SCHEMA.md`, `UI-UX-QOL.md`, `HANDHOLD.md`)
 
 ### Risk (`R2`)
 - **R1 Live exposure (`2`)**: Runs loopback/LAN by default with optional reverse-proxy exposure; enforces tag-scoped bearer/OAuth grants and high-entropy redaction checks on every write.
-- **R2 Irreversibility (`1`)**: Append-only revision history on resources; `HOLD_PUSH` enforced locally until security audit and owner sign-off pass.
+- **R2 Irreversibility (`1`)**: Append-only revision history on resources; repository publication is a manual owner post-audit step after `AUDIT.md` and owner sign-off pass.
 - **R3 Blast radius (`2`)**: Open-source repository under `Gavinbombay/Streamline`; requires zero private hostnames, zero LAN addresses, and zero secret-shaped fixtures from commit 1.
 - **R4 Evidence standing (`1`)**: Real loopback HTTP/MCP tests, SQLite round-trips, redaction negatives, and rendered terminal/UI captures required per slice.
 - **R5 Authorization and custody (`2`)**: Server-enforced rule acknowledgement before writes/dispatches; owner sign-off (`DOC-PENDING-OWNER`) required before closing a release.

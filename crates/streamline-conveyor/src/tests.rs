@@ -1241,3 +1241,80 @@ fn compute_tree_manifest_enforces_file_count_limit() {
         .expect_err("compute_tree_manifest must reject > MAX_MANIFEST_FILES");
     assert!(matches!(err, ConveyorError::StageFailure(msg) if msg.contains("exceeds maximum")));
 }
+
+#[test]
+fn high_fanout_and_deep_output_trees_record_quota_impasse() {
+    let tmp = TempDirGuard::new("conveyor-fanout-depth");
+    let spec_path = tmp.path.join("spec.md");
+    fs::write(&spec_path, "Input\n").expect("write spec.md");
+
+    let fanout_builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "dirs=\"\"
+         i=1
+         while [ \"$i\" -le 513 ]; do
+             dirs=\"$dirs d_$i\"
+             i=$((i + 1))
+         done
+         cd \"$STREAMLINE_OUT_DIR\" && mkdir $dirs",
+    );
+    let acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
+
+    let runs_dir = tmp.path.join("runs_fanout");
+    let cfg_fanout = base_config(&runs_dir, vec![fanout_builder, acceptor.clone()]);
+    let req_fanout = DispatchRequest {
+        project_id: "proj-fanout".to_string(),
+        input_paths: vec![spec_path.clone()],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+
+    let fanout_outcome =
+        execute_conveyor_blocking(&cfg_fanout, &req_fanout).expect("fanout returns Impasse");
+    assert_eq!(fanout_outcome.final_state, RunState::Impasse);
+    assert_eq!(fanout_outcome.build_run.state, RunState::Impasse);
+    assert!(!fanout_outcome.build_run.scan_clean);
+    assert!(fanout_outcome.accept_run.is_none());
+    let fanout_esc = fanout_outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("fanout escalation present");
+    assert!(fanout_esc.contains("OUTPUT_QUOTA_EXCEEDED"));
+
+    let deep_builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "p=\"$STREAMLINE_OUT_DIR\"
+         i=1
+         while [ \"$i\" -le 34 ]; do
+             p=\"$p/d$i\"
+             i=$((i + 1))
+         done
+         mkdir -p \"$p\"",
+    );
+    let runs_deep_dir = tmp.path.join("runs_deep");
+    let cfg_deep = base_config(&runs_deep_dir, vec![deep_builder, acceptor]);
+    let req_deep = DispatchRequest {
+        project_id: "proj-deep".to_string(),
+        input_paths: vec![spec_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+
+    let deep_outcome =
+        execute_conveyor_blocking(&cfg_deep, &req_deep).expect("deep nesting returns Impasse");
+    assert_eq!(deep_outcome.final_state, RunState::Impasse);
+    assert_eq!(deep_outcome.build_run.state, RunState::Impasse);
+    assert!(!deep_outcome.build_run.scan_clean);
+    assert!(deep_outcome.accept_run.is_none());
+    let deep_esc = deep_outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("deep escalation present");
+    assert!(deep_esc.contains("OUTPUT_QUOTA_EXCEEDED"));
+}

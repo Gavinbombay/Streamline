@@ -13,6 +13,7 @@ const BANNED_SCRATCH_DIRS: [&str; 5] = ["target", ".venv", "venv", "node_modules
 pub const MAX_MANIFEST_FILES: usize = crate::runner::MAX_OUTPUT_FILES;
 pub const MAX_MANIFEST_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_MANIFEST_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SCRATCH_ENTRIES: usize = 4_096;
 const MAX_STAGED_FILE_BYTES: usize = MAX_MANIFEST_FILE_BYTES;
 
 /// Deterministic SHA-256 manifest for a staged input or output directory tree.
@@ -72,7 +73,15 @@ pub(crate) fn stage_pinned_inputs(
         .open_or_create_subdir("INPUTS", 0o755)
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 
-    let mut copy_budget = StageCopyBudget::default();
+    if entries.len() > MAX_MANIFEST_FILES {
+        return Err(ConveyorError::StageFailure(format!(
+            "staged input entry count exceeds maximum of {MAX_MANIFEST_FILES} entries"
+        )));
+    }
+    let mut copy_budget = StageCopyBudget {
+        seen_entries: entries.len(),
+        ..StageCopyBudget::default()
+    };
     for entry in entries {
         match entry.parent_dir.is_regular_file_nofollow(&entry.leaf_name) {
             Ok(true) => {
@@ -92,7 +101,7 @@ pub(crate) fn stage_pinned_inputs(
                 let sub_dst = inputs_fd
                     .open_or_create_subdir(&entry.staged_basename, 0o755)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                copy_pinned_dir_recursive(&sub_src, &sub_dst, &mut copy_budget)?;
+                copy_pinned_dir_recursive(&sub_src, &sub_dst, 1, &mut copy_budget)?;
             }
             Err(err) => return Err(map_pinned_input_err(err, &entry.leaf_name)),
         }
@@ -153,7 +162,8 @@ pub fn unfreeze_readonly_dir(dir: &Path) -> Result<(), ConveyorError> {
     if !dir.exists() {
         return Ok(());
     }
-    unfreeze_recursive(dir, true)
+    let mut seen_entries = 0;
+    unfreeze_recursive(dir, true, 0, &mut seen_entries)
 }
 
 /// Recursively sets read-only permissions (`0o555` for directories and executable
@@ -161,6 +171,21 @@ pub fn unfreeze_readonly_dir(dir: &Path) -> Result<(), ConveyorError> {
 pub(crate) fn freeze_readonly_tree(path: &Path) -> Result<(), ConveyorError> {
     if !path.exists() {
         return Ok(());
+    }
+    let mut seen_entries = 0;
+    freeze_readonly_tree_bounded(path, 0, &mut seen_entries)
+}
+
+fn freeze_readonly_tree_bounded(
+    path: &Path,
+    depth: usize,
+    seen_entries: &mut usize,
+) -> Result<(), ConveyorError> {
+    if depth > crate::runner::MAX_TREE_DEPTH {
+        return Err(ConveyorError::StageFailure(format!(
+            "freeze tree depth exceeds maximum of {}",
+            crate::runner::MAX_TREE_DEPTH
+        )));
     }
 
     #[cfg(unix)]
@@ -175,8 +200,14 @@ pub(crate) fn freeze_readonly_tree(path: &Path) -> Result<(), ConveyorError> {
         if meta.is_dir() {
             let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
+                if *seen_entries >= MAX_SCRATCH_ENTRIES {
+                    return Err(ConveyorError::StageFailure(format!(
+                        "freeze tree entry count exceeds maximum of {MAX_SCRATCH_ENTRIES}"
+                    )));
+                }
+                *seen_entries += 1;
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                freeze_readonly_tree(&entry.path())?;
+                freeze_readonly_tree_bounded(&entry.path(), depth + 1, seen_entries)?;
             }
             fs::set_permissions(path, fs::Permissions::from_mode(0o555))
                 .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
@@ -198,8 +229,14 @@ pub(crate) fn freeze_readonly_tree(path: &Path) -> Result<(), ConveyorError> {
         if meta.is_dir() {
             let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
+                if *seen_entries >= MAX_SCRATCH_ENTRIES {
+                    return Err(ConveyorError::StageFailure(format!(
+                        "freeze tree entry count exceeds maximum of {MAX_SCRATCH_ENTRIES}"
+                    )));
+                }
+                *seen_entries += 1;
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                freeze_readonly_tree(&entry.path())?;
+                freeze_readonly_tree_bounded(&entry.path(), depth + 1, seen_entries)?;
             }
         }
         let mut perms = meta.permissions();
@@ -243,7 +280,8 @@ pub fn verify_no_symlink_components(path: &Path) -> Result<(), ConveyorError> {
     if meta.is_dir() {
         let dir_fd = PinnedDir::open_existing_dir(&trimmed)
             .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-        verify_no_symlinks_in_pinned_dir(&dir_fd)?;
+        let mut seen_entries = 0;
+        verify_no_symlinks_in_pinned_dir(&dir_fd, 0, &mut seen_entries)?;
     }
     Ok(())
 }
@@ -253,7 +291,14 @@ pub fn verify_cleanup_clean(work_dir: &Path) -> Result<(), ConveyorError> {
     if !work_dir.exists() {
         return Ok(());
     }
-    check_banned(work_dir, work_dir, &BANNED_SCRATCH_DIRS)
+    let mut seen_entries = 0;
+    check_banned(
+        work_dir,
+        work_dir,
+        &BANNED_SCRATCH_DIRS,
+        0,
+        &mut seen_entries,
+    )
 }
 
 pub(crate) fn trim_trailing_slashes_and_dot(path: &Path) -> PathBuf {
@@ -285,10 +330,28 @@ pub(crate) fn trim_trailing_slashes_and_dot(path: &Path) -> PathBuf {
     }
 }
 
-fn verify_no_symlinks_in_pinned_dir(dir_fd: &PinnedDir) -> Result<(), ConveyorError> {
-    let names = dir_fd
-        .list_entry_names()
-        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+fn verify_no_symlinks_in_pinned_dir(
+    dir_fd: &PinnedDir,
+    depth: usize,
+    seen_entries: &mut usize,
+) -> Result<(), ConveyorError> {
+    if depth > crate::runner::MAX_TREE_DEPTH {
+        return Err(ConveyorError::StageFailure(format!(
+            "input directory depth exceeds maximum of {}",
+            crate::runner::MAX_TREE_DEPTH
+        )));
+    }
+    let remaining = MAX_MANIFEST_FILES.saturating_sub(*seen_entries);
+    let names = dir_fd.list_entry_names_bounded(remaining).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            ConveyorError::StageFailure(format!(
+                "input directory entry count exceeds maximum of {MAX_MANIFEST_FILES}"
+            ))
+        } else {
+            ConveyorError::StageFailure(e.to_string())
+        }
+    })?;
+    *seen_entries = seen_entries.saturating_add(names.len());
     for name in names {
         match dir_fd.is_regular_file_nofollow(&name) {
             Ok(true) => {}
@@ -296,7 +359,7 @@ fn verify_no_symlinks_in_pinned_dir(dir_fd: &PinnedDir) -> Result<(), ConveyorEr
                 let sub_fd = dir_fd
                     .open_subdir(&name)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                verify_no_symlinks_in_pinned_dir(&sub_fd)?;
+                verify_no_symlinks_in_pinned_dir(&sub_fd, depth + 1, seen_entries)?;
             }
             Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
         }
@@ -358,6 +421,7 @@ fn open_parent_and_leaf(
 
 #[derive(Default)]
 struct StageCopyBudget {
+    seen_entries: usize,
     copied_files: usize,
     copied_bytes: usize,
 }
@@ -365,11 +429,28 @@ struct StageCopyBudget {
 fn copy_pinned_dir_recursive(
     src_dir: &PinnedDir,
     dst_dir: &PinnedDir,
+    depth: usize,
     budget: &mut StageCopyBudget,
 ) -> Result<(), ConveyorError> {
+    if depth > crate::runner::MAX_TREE_DEPTH {
+        return Err(ConveyorError::StageFailure(format!(
+            "staged input directory depth exceeds maximum of {}",
+            crate::runner::MAX_TREE_DEPTH
+        )));
+    }
+    let remaining_entries = MAX_MANIFEST_FILES.saturating_sub(budget.seen_entries);
     let child_names = src_dir
-        .list_entry_names()
-        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        .list_entry_names_bounded(remaining_entries)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidData {
+                ConveyorError::StageFailure(format!(
+                    "staged input entry count exceeds maximum of {MAX_MANIFEST_FILES}"
+                ))
+            } else {
+                ConveyorError::StageFailure(e.to_string())
+            }
+        })?;
+    budget.seen_entries = budget.seen_entries.saturating_add(child_names.len());
     for child in child_names {
         match src_dir.is_regular_file_nofollow(&child) {
             Ok(true) => copy_pinned_file(src_dir, &child, dst_dir, &child, budget)?,
@@ -380,7 +461,7 @@ fn copy_pinned_dir_recursive(
                 let sub_dst = dst_dir
                     .open_or_create_subdir(&child, 0o755)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                copy_pinned_dir_recursive(&sub_src, &sub_dst, budget)?;
+                copy_pinned_dir_recursive(&sub_src, &sub_dst, depth + 1, budget)?;
             }
             Err(err) => return Err(map_pinned_input_err(err, &child)),
         }
@@ -460,15 +541,17 @@ fn copy_pinned_file(
 
 struct ManifestAccumulator {
     entries: Vec<(String, String)>,
+    seen_entries: usize,
     total_bytes: usize,
 }
 
 fn compute_pinned_manifest(root_fd: &PinnedDir) -> Result<StagedManifest, ConveyorError> {
     let mut acc = ManifestAccumulator {
         entries: Vec::new(),
+        seen_entries: 0,
         total_bytes: 0,
     };
-    collect_files_pinned(root_fd, "", &mut acc)?;
+    collect_files_pinned(root_fd, "", 0, &mut acc)?;
     acc.entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut combined = Sha256::new();
@@ -489,11 +572,28 @@ fn compute_pinned_manifest(root_fd: &PinnedDir) -> Result<StagedManifest, Convey
 fn collect_files_pinned(
     dir_fd: &PinnedDir,
     prefix: &str,
+    depth: usize,
     acc: &mut ManifestAccumulator,
 ) -> Result<(), ConveyorError> {
+    if depth > crate::runner::MAX_TREE_DEPTH {
+        return Err(ConveyorError::StageFailure(format!(
+            "manifest directory depth exceeds maximum of {}",
+            crate::runner::MAX_TREE_DEPTH
+        )));
+    }
+    let remaining_entries = MAX_MANIFEST_FILES.saturating_sub(acc.seen_entries);
     let names = dir_fd
-        .list_entry_names()
-        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        .list_entry_names_bounded(remaining_entries)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidData {
+                ConveyorError::StageFailure(format!(
+                    "manifest directory entry count exceeds maximum of {MAX_MANIFEST_FILES}"
+                ))
+            } else {
+                ConveyorError::StageFailure(e.to_string())
+            }
+        })?;
+    acc.seen_entries = acc.seen_entries.saturating_add(names.len());
     for name in names {
         if name == "SHA256SUMS" || name == ".git" {
             continue;
@@ -539,7 +639,7 @@ fn collect_files_pinned(
                 let sub_fd = dir_fd
                     .open_subdir(&name)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                collect_files_pinned(&sub_fd, &rel, acc)?;
+                collect_files_pinned(&sub_fd, &rel, depth + 1, acc)?;
             }
             Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
         }
@@ -570,7 +670,19 @@ fn validate_single_segment(name: &str) -> Result<(), ConveyorError> {
     Ok(())
 }
 
-fn unfreeze_recursive(path: &Path, is_root: bool) -> Result<(), ConveyorError> {
+fn unfreeze_recursive(
+    path: &Path,
+    is_root: bool,
+    depth: usize,
+    seen_entries: &mut usize,
+) -> Result<(), ConveyorError> {
+    if depth > crate::runner::MAX_TREE_DEPTH {
+        return Err(ConveyorError::StageFailure(format!(
+            "unfreeze tree depth exceeds maximum of {}",
+            crate::runner::MAX_TREE_DEPTH
+        )));
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -590,8 +702,14 @@ fn unfreeze_recursive(path: &Path, is_root: bool) -> Result<(), ConveyorError> {
                 .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
+                if *seen_entries >= MAX_SCRATCH_ENTRIES {
+                    return Err(ConveyorError::StageFailure(format!(
+                        "unfreeze tree entry count exceeds maximum of {MAX_SCRATCH_ENTRIES}"
+                    )));
+                }
+                *seen_entries += 1;
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                unfreeze_recursive(&entry.path(), false)?;
+                unfreeze_recursive(&entry.path(), false, depth + 1, seen_entries)?;
             }
         } else if meta.is_file() {
             let is_exec = meta.permissions().mode() & 0o111 != 0;
@@ -619,8 +737,14 @@ fn unfreeze_recursive(path: &Path, is_root: bool) -> Result<(), ConveyorError> {
         if meta.is_dir() {
             let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
+                if *seen_entries >= MAX_SCRATCH_ENTRIES {
+                    return Err(ConveyorError::StageFailure(format!(
+                        "unfreeze tree entry count exceeds maximum of {MAX_SCRATCH_ENTRIES}"
+                    )));
+                }
+                *seen_entries += 1;
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                unfreeze_recursive(&entry.path(), false)?;
+                unfreeze_recursive(&entry.path(), false, depth + 1, seen_entries)?;
             }
         }
     }
@@ -659,9 +783,30 @@ fn resolve_input_basename(path: &Path) -> Result<String, ConveyorError> {
     Ok(text.to_string())
 }
 
-fn check_banned(root: &Path, current: &Path, banned: &[&str]) -> Result<(), ConveyorError> {
+fn check_banned(
+    root: &Path,
+    current: &Path,
+    banned: &[&str],
+    depth: usize,
+    seen_entries: &mut usize,
+) -> Result<(), ConveyorError> {
+    if depth > crate::runner::MAX_TREE_DEPTH {
+        return Err(ConveyorError::DirtyScratch(format!(
+            "scratch directory depth exceeds maximum of {}",
+            crate::runner::MAX_TREE_DEPTH
+        )));
+    }
     let rd = fs::read_dir(current).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-    for entry in rd.flatten() {
+    for entry in rd {
+        if *seen_entries >= MAX_SCRATCH_ENTRIES {
+            return Err(ConveyorError::DirtyScratch(format!(
+                "scratch entry count exceeds maximum of {MAX_SCRATCH_ENTRIES}"
+            )));
+        }
+        *seen_entries += 1;
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
@@ -678,7 +823,7 @@ fn check_banned(root: &Path, current: &Path, banned: &[&str]) -> Result<(), Conv
                     .unwrap_or_else(|_| name.to_string());
                 return Err(ConveyorError::DirtyScratch(rel));
             }
-            check_banned(root, &path, banned)?;
+            check_banned(root, &path, banned, depth + 1, seen_entries)?;
         }
     }
     Ok(())

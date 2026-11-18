@@ -14,6 +14,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
 
 const MAX_TEXT_READ_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_DIR_ENTRIES: usize = 16_384;
+pub const MAX_ENTRY_NAME_BYTES: usize = 255;
 
 /// A pinned directory handle that executes child lookups, reads, and atomic
 /// writes relative to an open directory file descriptor on Unix.
@@ -153,8 +155,16 @@ impl PinnedDir {
         Ok(dir)
     }
 
-    /// Lists sorted valid UTF-8 entry names in this directory, excluding `.` and `..`.
+    /// Lists sorted valid UTF-8 entry names in this directory, excluding `.` and `..`,
+    /// up to [`DEFAULT_MAX_DIR_ENTRIES`].
     pub fn list_entry_names(&self) -> io::Result<Vec<String>> {
+        self.list_entry_names_bounded(DEFAULT_MAX_DIR_ENTRIES)
+    }
+
+    /// Lists sorted valid UTF-8 entry names in this directory, excluding `.` and `..`,
+    /// returning `ErrorKind::InvalidData` immediately if entries exceed `max_entries`
+    /// or `MAX_ENTRY_NAME_BYTES`.
+    pub fn list_entry_names_bounded(&self, max_entries: usize) -> io::Result<Vec<String>> {
         let dup_fd = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if dup_fd < 0 {
             return Err(io::Error::last_os_error());
@@ -185,6 +195,8 @@ impl PinnedDir {
         }
 
         let mut names = Vec::new();
+        let mut raw_entries: usize = 0;
+        let max_raw_entries = max_entries.saturating_add(16);
         loop {
             unsafe {
                 clear_errno();
@@ -200,11 +212,33 @@ impl PinnedDir {
                 break;
             }
             let c_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            let raw_bytes = c_name.to_bytes();
+            if raw_bytes == b"." || raw_bytes == b".." {
+                continue;
+            }
+            raw_entries = raw_entries.saturating_add(1);
+            if raw_entries > max_raw_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory exceeds maximum allowed entry count ({max_entries})"),
+                ));
+            }
+            if raw_bytes.len() > MAX_ENTRY_NAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "directory entry name exceeds maximum allowed {MAX_ENTRY_NAME_BYTES} bytes"
+                    ),
+                ));
+            }
             let Ok(name_str) = c_name.to_str() else {
                 continue;
             };
-            if name_str == "." || name_str == ".." {
-                continue;
+            if names.len() >= max_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("directory exceeds maximum allowed entry count ({max_entries})"),
+                ));
             }
             names.push(name_str.to_string());
         }
@@ -1086,5 +1120,39 @@ mod tests {
                 b"ok644\n"
             );
         }
+    }
+
+    #[test]
+    fn list_entry_names_bounded_stops_before_exceeding_cap() {
+        let tmp = TempDirGuard::new("pinned-fs-bounded-list");
+        let dir = PinnedDir::open_existing_dir(&tmp.path).expect("open temp dir");
+
+        let empty_sub = dir
+            .open_or_create_subdir("empty_sub", 0o755)
+            .expect("create empty_sub");
+        assert!(empty_sub
+            .list_entry_names_bounded(0)
+            .expect("empty dir with max_entries=0 succeeds")
+            .is_empty());
+
+        for idx in 0..9 {
+            dir.atomic_write_nofollow(&format!("item_{idx:02}.txt"), b"x\n", 0o644)
+                .expect("write bounded list item");
+        }
+        // Total entries = 1 subdir (empty_sub) + 9 files = 10 entries.
+        let cap_err = dir
+            .list_entry_names_bounded(5)
+            .expect_err("cap of 5 must fail on 10-entry directory");
+        assert_eq!(cap_err.kind(), io::ErrorKind::InvalidData);
+
+        let zero_err = dir
+            .list_entry_names_bounded(0)
+            .expect_err("cap of 0 must fail on non-empty directory");
+        assert_eq!(zero_err.kind(), io::ErrorKind::InvalidData);
+
+        let all = dir
+            .list_entry_names_bounded(10)
+            .expect("exact cap of 10 must succeed");
+        assert_eq!(all.len(), 10);
     }
 }

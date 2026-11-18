@@ -18,6 +18,8 @@ use crate::staging::{
 
 const SAFE_ENV_VARS: [&str; 4] = ["PATH", "HOME", "TMPDIR", "LANG"];
 pub const MAX_OUTPUT_FILES: usize = 512;
+pub const MAX_DIR_ENTRIES: usize = 512;
+pub const MAX_TREE_DEPTH: usize = 32;
 pub const MAX_SINGLE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOTAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCAN_FINDINGS: usize = 64;
@@ -143,10 +145,15 @@ pub fn execute_conveyor_blocking(
     };
 
     let outcome = execute_conveyor_inner(&ctx);
-    if let Err(unfreeze_err) = unfreeze_readonly_dir(&run_dir) {
-        if outcome.is_ok() {
-            return Err(unfreeze_err);
-        }
+    let unfreeze_stage = unfreeze_readonly_dir(&ctx.stage_dir.join("INPUTS"));
+    let unfreeze_out = if matches!(&outcome, Ok(o) if o.accept_run.is_some()) || outcome.is_err() {
+        unfreeze_readonly_dir(&ctx.out_dir)
+    } else {
+        Ok(())
+    };
+    if outcome.is_ok() {
+        unfreeze_stage?;
+        unfreeze_out?;
     }
     outcome
 }
@@ -785,7 +792,7 @@ fn pin_entry_from_root(
             .to_string();
         let parent_dir =
             PinnedDir::open_existing_dir(parent_path).map_err(|e| map_walk_err(e, display_path))?;
-        verify_no_symlinks_pinned(&matched_root.dir, display_path)?;
+        verify_no_symlinks_pinned(&matched_root.dir, display_path, 0, &mut 0)?;
         return Ok(PinnedInputEntry {
             parent_dir,
             leaf_name: leaf_name.clone(),
@@ -818,7 +825,7 @@ fn pin_entry_from_root(
             let sub_dir = parent_dir
                 .open_subdir(&leaf_name)
                 .map_err(|e| map_walk_err(e, display_path))?;
-            verify_no_symlinks_pinned(&sub_dir, display_path)?;
+            verify_no_symlinks_pinned(&sub_dir, display_path, 0, &mut 0)?;
         }
         Err(err) => return Err(map_walk_err(err, display_path)),
     }
@@ -830,10 +837,28 @@ fn pin_entry_from_root(
     })
 }
 
-fn verify_no_symlinks_pinned(dir: &PinnedDir, display_path: &str) -> Result<(), InputPinError> {
-    let names = dir
-        .list_entry_names()
-        .map_err(|e| map_walk_err(e, display_path))?;
+fn verify_no_symlinks_pinned(
+    dir: &PinnedDir,
+    display_path: &str,
+    depth: usize,
+    seen_entries: &mut usize,
+) -> Result<(), InputPinError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(InputPinError::InvalidConfig(format!(
+            "input directory '{display_path}' exceeds maximum directory depth ({MAX_TREE_DEPTH})"
+        )));
+    }
+    let remaining = MAX_DIR_ENTRIES.saturating_sub(*seen_entries);
+    let names = dir.list_entry_names_bounded(remaining).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            InputPinError::InvalidConfig(format!(
+                "input directory '{display_path}' exceeds maximum entry budget ({MAX_DIR_ENTRIES})"
+            ))
+        } else {
+            map_walk_err(e, display_path)
+        }
+    })?;
+    *seen_entries = seen_entries.saturating_add(names.len());
     for name in names {
         match dir.is_regular_file_nofollow(&name) {
             Ok(true) => {}
@@ -841,7 +866,7 @@ fn verify_no_symlinks_pinned(dir: &PinnedDir, display_path: &str) -> Result<(), 
                 let sub = dir
                     .open_subdir(&name)
                     .map_err(|e| map_walk_err(e, display_path))?;
-                verify_no_symlinks_pinned(&sub, display_path)?;
+                verify_no_symlinks_pinned(&sub, display_path, depth + 1, seen_entries)?;
             }
             Err(err) => return Err(map_walk_err(err, display_path)),
         }
@@ -1219,6 +1244,7 @@ fn run_harness_command(
 
 #[derive(Default)]
 struct OutputScanState {
+    seen_entries: usize,
     seen_files: usize,
     total_bytes: usize,
     findings: Vec<OutputScanFinding>,
@@ -1235,7 +1261,7 @@ fn scan_utf8_outputs(
     };
 
     let mut state = OutputScanState::default();
-    if let Some(quota_reason) = scan_pinned_dir(&root_fd, "", policy, &mut state)? {
+    if let Some(quota_reason) = scan_pinned_dir(&root_fd, "", 0, policy, &mut state)? {
         return Ok(OutputScanOutcome::QuotaExceeded(quota_reason));
     }
     if !state.findings.is_empty() {
@@ -1247,12 +1273,27 @@ fn scan_utf8_outputs(
 fn scan_pinned_dir(
     dir_fd: &PinnedDir,
     prefix: &str,
+    depth: usize,
     policy: &RedactionPolicy,
     state: &mut OutputScanState,
 ) -> Result<Option<String>, ConveyorError> {
-    let names = dir_fd
-        .list_entry_names()
-        .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    if depth > MAX_TREE_DEPTH {
+        return Ok(Some(format!(
+            "output directory depth exceeds maximum {MAX_TREE_DEPTH}"
+        )));
+    }
+
+    let remaining_entries = MAX_OUTPUT_FILES.saturating_sub(state.seen_entries);
+    let names = match dir_fd.list_entry_names_bounded(remaining_entries) {
+        Ok(names) => names,
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+            return Ok(Some(format!(
+                "output directory entry count exceeded maximum budget of {MAX_DIR_ENTRIES} entries"
+            )));
+        }
+        Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
+    };
+    state.seen_entries = state.seen_entries.saturating_add(names.len());
 
     for name in names {
         let rel_path = if prefix.is_empty() {
@@ -1317,7 +1358,8 @@ fn scan_pinned_dir(
                 let sub_fd = dir_fd
                     .open_subdir(&name)
                     .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-                if let Some(reason) = scan_pinned_dir(&sub_fd, &rel_path, policy, state)? {
+                if let Some(reason) = scan_pinned_dir(&sub_fd, &rel_path, depth + 1, policy, state)?
+                {
                     return Ok(Some(reason));
                 }
             }
