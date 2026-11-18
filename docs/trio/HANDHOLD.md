@@ -39,6 +39,7 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 | `REQ-14` | `OWN-005` | 3-pane Web UI preserves exact Streamline dark palette, `16px`/`14px` floors, `44px` targets, and expanded word diffs | DOM/CSS assertion suite | X | | | | |
 | `REQ-15` | `OWN-006` | Open-source UI renders default status mark while loading private Presence canvas only when `presence_plugin_dir` is configured | Plugin mount isolation test | X | | | | |
 | `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, and `AUDIT.md` PASS | Official scanner + 6-phase audit | X | | | | |
+| `REQ-17` | `OWN-011` | Closeout enforces verified temp cleanup (`mark_project_cleanup_verified`), forward lessons in the central `lessons_learned` DB (`record_lesson` / `query_lessons`), and plain-English non-technical `HOW-IT-WORKS.md` approval | Store + MCP closeout gate suite | X | | | | |
 
 ## 3. Four-Gate Independent Acceptance (`L10`)
 

@@ -1,0 +1,17 @@
+[package]
+name = "streamline-store"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "Apache-2.0"
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+streamline-core = { path = "../streamline-core" }
+thiserror.workspace = true
+uuid.workspace = true

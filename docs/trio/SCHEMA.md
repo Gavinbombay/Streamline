@@ -50,7 +50,7 @@ max_concurrency = 2
 1. **`principals`**: `id`, `handle`, `role` (`owner | member | agent | guest`), `created_at`.
 2. **`access_grants`**: `grant_id`, `principal_id`, `credential_hash`, `granted_tags_json`, `can_write`, `can_dispatch`, `acked_rules_sha256`, `expires_at`, `revoked_at`.
 3. **`shelves`**: `slug` (`standards | runbooks | architecture | projects | skills | inbox | archive`), `title`, `required_tag`.
-4. **`resources`**: `id`, `shelf_slug`, `slug`, `project_id`, `trio_role`, `title`, `current_rev`, `current_sha256`, `deleted_at`, `updated_at`.
+4. **`resources`**: `id`, `shelf_slug`, `slug`, `project_id`, `trio_role`, `lifecycle_tier` (`active | dormant | legacy | retired`), `triage_state` (`reviewed | needs_triage`), `title`, `current_rev`, `current_sha256`, `deleted_at`, `updated_at` (`bootstrap` surfaces `lifecycle_tier = 'active'` only; `dormant` and `legacy` remain searchable and revivable in triage views without polluting agent bootstrap).
 5. **`resource_revisions`**: `resource_id`, `rev`, `body_md`, `sha256`, `author_principal`, `summary`, `created_at` (append-only).
 6. **`source_passports`**: `resource_id`, `steward`, `last_verified_at`, `freshness_state` (`verified | stale | drift | unknown`), `lineage_ref`, `access_scope`, `next_action`.
 7. **`trio_projects`**: `project_id`, `title`, `work_kind` (`software | council | procedure | general`), `difficulty` (`0..4`), `risk` (`0..4`), `profile` (`P0 | P1 | P2 | P3 | P4`), `expected_roles_json`, `plan_locked_rev`, `state`, `how_it_works_resource_id`, `created_at`.
@@ -60,6 +60,7 @@ max_concurrency = 2
 11. **`sync_reports`**: `report_id`, `project_id`, `plan_rev`, `asbuilt_rev`, `paired_rows_json`, `verdict` (`pass | fail | partial`), `acceptor_family`, `created_at`.
 12. **`conveyor_runs`**: `run_id`, `project_id`, `phase` (`build | accept`), `harness_id`, `family`, `input_manifest_sha256`, `output_manifest_sha256`, `cleanup_clean`, `scan_clean`, `state`, `started_at`, `finished_at`.
 13. **`audit_events`**: `event_id`, `principal_id`, `action`, `target_id`, `outcome`, `detail_json`, `created_at`.
+14. **`lessons_learned`** (Central Learning Database): `lesson_id`, `project_id`, `tags_json`, `observed_fact`, `cause_kind` (`demonstrated | hypothesis`), `cause_note`, `forward_rule`, `validation_state` (`worked_once | verified_reusable`), `recorded_by`, `created_at` (synced to `<vault>/lessons/` and surfaced automatically in `bootstrap` / `query_lessons`; `trio_projects` tracks `cleanup_verified` and `lessons_satisfied` so `submit_how_it_works` blocks closeout until temp cleanup and forward central lessons are both recorded).
 
 ## 4. MCP and HTTP Tool Contract (`L5`)
 

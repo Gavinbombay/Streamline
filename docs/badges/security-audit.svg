@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="218" height="28" role="img" aria-label="security audit: pending AUDIT.md">
+  <linearGradient id="b" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+  <mask id="a"><rect width="218" height="28" rx="6" fill="#fff"/></mask>
+  <g mask="url(#a)">
+    <path fill="#192a3d" d="M0 0h100v28H0z"/>
+    <path fill="#3b4d63" d="M100 0h118v28H100z"/>
+    <path fill="url(#b)" d="M0 0h218v28H0z"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="50" y="17.5" fill="#010101" fill-opacity=".3">security audit</text>
+    <text x="50" y="16.5">security audit</text>
+    <text x="159" y="17.5" fill="#010101" fill-opacity=".3">pending AUDIT.md</text>
+    <text x="159" y="16.5">pending AUDIT.md</text>
+  </g>
+</svg>
