@@ -24,6 +24,8 @@ pub struct CreateGrantRequest {
     pub can_write: bool,
     pub can_dispatch: bool,
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub model_family: Option<String>,
 }
 
 /// Public representation of an access grant (never exposes raw credentials or hashes).
@@ -39,6 +41,8 @@ pub struct AccessGrant {
     pub acked_rules_sha256: Option<String>,
     pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub model_family: Option<String>,
 }
 
 /// Authorized shelf summary with item and freshness counts.

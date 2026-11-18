@@ -71,7 +71,7 @@ mod tests {
 
     use rusqlite::{params, Connection};
     use streamline_core::{
-        AssessmentInput, DivergenceStatus, FreshnessState, LifecycleTier, PairedSyncRow,
+        AssessmentInput, CoreError, DivergenceStatus, FreshnessState, LifecycleTier, PairedSyncRow,
         PrincipalRole, ReqStage, RunState, SyncVerdict, TriageState, TrioProfile, WorkKind,
     };
 
@@ -108,15 +108,17 @@ mod tests {
                 can_write: true,
                 can_dispatch: true,
                 expires_at: None,
+                model_family: None,
             })
             .expect("create owner grant")
     }
 
-    fn seed_agent_grant(
+    fn seed_agent_grant_with_family(
         store: &StreamlineStore,
         id: &str,
         cred: &str,
         tags: Vec<String>,
+        model_family: Option<&str>,
     ) -> AccessGrant {
         store
             .upsert_principal(id, id, PrincipalRole::Agent)
@@ -130,8 +132,18 @@ mod tests {
                 can_write: true,
                 can_dispatch: false,
                 expires_at: None,
+                model_family: model_family.map(str::to_string),
             })
             .expect("create agent grant")
+    }
+
+    fn seed_agent_grant(
+        store: &StreamlineStore,
+        id: &str,
+        cred: &str,
+        tags: Vec<String>,
+    ) -> AccessGrant {
+        seed_agent_grant_with_family(store, id, cred, tags, None)
     }
 
     fn sample_assessment() -> AssessmentInput {
@@ -369,12 +381,19 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
     fn trio_project_idempotency_own_lock_div_and_release_gate() {
         let store = StreamlineStore::open_in_memory().expect("open store");
         let owner = seed_owner_grant(&store);
-        let worker = seed_agent_grant(&store, "worker-a", "cred-worker-a", vec!["*".to_string()]);
-        let acceptor = seed_agent_grant(
+        let worker = seed_agent_grant_with_family(
+            &store,
+            "worker-a",
+            "cred-worker-a",
+            vec!["*".to_string()],
+            Some("openai-codex"),
+        );
+        let acceptor = seed_agent_grant_with_family(
             &store,
             "acceptor-b",
             "cred-acceptor-b",
             vec!["*".to_string()],
+            Some("google-gemini"),
         );
 
         let rules_sha = store.current_rules_sha256().expect("sha");
@@ -969,6 +988,646 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
         assert_eq!(
             imported_guide.body_md,
             "Latest revision body from document_revision"
+        );
+    }
+
+    #[test]
+    fn save_resource_blocks_cross_project_and_unscoped_overwrite() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        store
+            .ack_rules(&owner.grant_id, &rules_sha)
+            .expect("ack owner");
+
+        store
+            .save_resource(
+                &owner.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "other-doc".to_string(),
+                    title: "Other Project Doc".to_string(),
+                    body_md: "Protected other project content.".to_string(),
+                    project_id: Some("other".to_string()),
+                    trio_role: None,
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Seed other project doc".to_string(),
+                    expected_rev: None,
+                },
+            )
+            .expect("save other project doc");
+
+        store
+            .save_resource(
+                &owner.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "unscoped-doc".to_string(),
+                    title: "Unscoped Projects Doc".to_string(),
+                    body_md: "Protected unscoped content.".to_string(),
+                    project_id: None,
+                    trio_role: None,
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Seed unscoped project doc".to_string(),
+                    expected_rev: None,
+                },
+            )
+            .expect("save unscoped project doc");
+
+        let demo_agent = seed_agent_grant(
+            &store,
+            "demo-agent",
+            "cred-demo-agent",
+            vec!["project:demo".to_string()],
+        );
+        store
+            .ack_rules(&demo_agent.grant_id, &rules_sha)
+            .expect("ack demo agent");
+
+        let overwrite_other = store.save_resource(
+            &demo_agent.grant_id,
+            SaveResourceRequest {
+                shelf_slug: "projects".to_string(),
+                slug: "other-doc".to_string(),
+                title: "Hijacked Title".to_string(),
+                body_md: "Hijacked body.".to_string(),
+                project_id: Some("demo".to_string()),
+                trio_role: None,
+                lifecycle_tier: Some(LifecycleTier::Active),
+                triage_state: Some(TriageState::Reviewed),
+                summary: "Attempt overwrite".to_string(),
+                expected_rev: None,
+            },
+        );
+        assert!(matches!(
+            overwrite_other,
+            Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "project:other"
+        ));
+
+        let overwrite_unscoped = store.save_resource(
+            &demo_agent.grant_id,
+            SaveResourceRequest {
+                shelf_slug: "projects".to_string(),
+                slug: "unscoped-doc".to_string(),
+                title: "Hijacked Unscoped".to_string(),
+                body_md: "Hijacked unscoped body.".to_string(),
+                project_id: Some("demo".to_string()),
+                trio_role: None,
+                lifecycle_tier: Some(LifecycleTier::Active),
+                triage_state: Some(TriageState::Reviewed),
+                summary: "Attempt unscoped overwrite".to_string(),
+                expected_rev: None,
+            },
+        );
+        assert!(matches!(
+            overwrite_unscoped,
+            Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "projects"
+        ));
+
+        store
+            .save_resource(
+                &demo_agent.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "demo-own".to_string(),
+                    title: "Demo Own".to_string(),
+                    body_md: "Demo content.".to_string(),
+                    project_id: Some("demo".to_string()),
+                    trio_role: None,
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Demo write".to_string(),
+                    expected_rev: None,
+                },
+            )
+            .expect("create demo doc");
+
+        let move_to_other = store.save_resource(
+            &demo_agent.grant_id,
+            SaveResourceRequest {
+                shelf_slug: "projects".to_string(),
+                slug: "demo-own".to_string(),
+                title: "Moved".to_string(),
+                body_md: "Moved.".to_string(),
+                project_id: Some("other".to_string()),
+                trio_role: None,
+                lifecycle_tier: Some(LifecycleTier::Active),
+                triage_state: Some(TriageState::Reviewed),
+                summary: "Attempt move".to_string(),
+                expected_rev: None,
+            },
+        );
+        assert!(matches!(
+            move_to_other,
+            Err(StoreError::ForbiddenTag { ref required_tag }) if required_tag == "project:other"
+        ));
+
+        let other_after = store
+            .read_resource(&owner.grant_id, "projects", "other-doc")
+            .expect("read other-doc");
+        assert_eq!(other_after.body_md, "Protected other project content.");
+        assert_eq!(other_after.resource.project_id.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn lock_project_plan_rejects_nonexistent_revision_without_locking_own() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        store
+            .ack_rules(&owner.grant_id, &rules_sha)
+            .expect("ack owner");
+
+        store
+            .create_trio_project(
+                &owner.grant_id,
+                CreateTrioProjectRequest {
+                    project_id: "proj-rev-check".to_string(),
+                    create_id: None,
+                    title: "Plan Rev Check".to_string(),
+                    assessment: sample_assessment(),
+                    opt_in_modules: Vec::new(),
+                    initial_own_decisions: vec![OwnDecisionInput {
+                        own_id: "OWN-001".to_string(),
+                        statement: "Original choice".to_string(),
+                    }],
+                    initial_requirements: Vec::new(),
+                },
+            )
+            .expect("create project");
+
+        let phantom = store.lock_project_plan(&owner.grant_id, "proj-rev-check", Some(999));
+        assert!(matches!(phantom, Err(StoreError::InvalidInput(_))));
+
+        let zero_rev = store.lock_project_plan(&owner.grant_id, "proj-rev-check", Some(0));
+        assert!(matches!(zero_rev, Err(StoreError::InvalidInput(_))));
+
+        let bundle_before = store
+            .get_project_bundle(&owner.grant_id, "proj-rev-check")
+            .expect("bundle before valid lock");
+        assert_eq!(bundle_before.project.plan_locked_rev, None);
+        assert!(bundle_before.own_decisions[0].locked_at.is_none());
+
+        store
+            .upsert_own_decision(
+                &owner.grant_id,
+                "proj-rev-check",
+                "OWN-001",
+                "Refined choice before lock",
+                None,
+            )
+            .expect("OWN must remain editable after rejected lock");
+
+        let locked = store
+            .lock_project_plan(&owner.grant_id, "proj-rev-check", Some(1))
+            .expect("lock existing rev 1");
+        assert_eq!(locked.plan_locked_rev, Some(1));
+    }
+
+    #[test]
+    fn update_requirement_stage_enforces_grant_model_family_and_blocks_spoofing() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let unbound_worker = seed_agent_grant_with_family(
+            &store,
+            "unbound-worker",
+            "cred-unbound-w",
+            vec!["*".to_string()],
+            None,
+        );
+        let codex_worker = seed_agent_grant_with_family(
+            &store,
+            "codex-worker",
+            "cred-codex-w",
+            vec!["*".to_string()],
+            Some("openai-codex"),
+        );
+        let codex_peer = seed_agent_grant_with_family(
+            &store,
+            "codex-peer",
+            "cred-codex-p",
+            vec!["*".to_string()],
+            Some("openai-codex"),
+        );
+        let gemini_acceptor = seed_agent_grant_with_family(
+            &store,
+            "gemini-acceptor",
+            "cred-gemini-a",
+            vec!["*".to_string()],
+            Some("google-gemini"),
+        );
+
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        for g in [
+            &owner.grant_id,
+            &unbound_worker.grant_id,
+            &codex_worker.grant_id,
+            &codex_peer.grant_id,
+            &gemini_acceptor.grant_id,
+        ] {
+            store.ack_rules(g, &rules_sha).expect("ack rules");
+        }
+
+        store
+            .create_trio_project(
+                &owner.grant_id,
+                CreateTrioProjectRequest {
+                    project_id: "proj-family-gate".to_string(),
+                    create_id: None,
+                    title: "Model Family Gate".to_string(),
+                    assessment: sample_assessment(),
+                    opt_in_modules: Vec::new(),
+                    initial_own_decisions: Vec::new(),
+                    initial_requirements: vec![RequirementRowInput {
+                        req_id: "REQ-01".to_string(),
+                        source_id: "PLAN".to_string(),
+                        statement: "Enforce grant-bound family provenance".to_string(),
+                    }],
+                },
+            )
+            .expect("create R2 project");
+
+        let unbound_spoof = store.update_requirement_stage(
+            &unbound_worker.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-family-gate".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::I,
+                evidence_ref: "commit-1".to_string(),
+                actor_family: Some("openai-codex".to_string()),
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(unbound_spoof, Err(StoreError::ForbiddenRole(_))));
+
+        let unbound_none = store.update_requirement_stage(
+            &unbound_worker.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-family-gate".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::I,
+                evidence_ref: "commit-1".to_string(),
+                actor_family: None,
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(unbound_none, Err(StoreError::InvalidState(_))));
+
+        let built = store
+            .update_requirement_stage(
+                &codex_worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-family-gate".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::T,
+                    evidence_ref: "unit tests passed".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("bound worker marks T without caller actor_family");
+        assert_eq!(built.builder_family.as_deref(), Some("openai-codex"));
+
+        let spoof_accept = store.update_requirement_stage(
+            &codex_peer.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-family-gate".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::A,
+                evidence_ref: "spoofed family".to_string(),
+                actor_family: Some("google-gemini".to_string()),
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(spoof_accept, Err(StoreError::ForbiddenRole(_))));
+
+        let same_family = store.update_requirement_stage(
+            &codex_peer.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-family-gate".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::A,
+                evidence_ref: "same family".to_string(),
+                actor_family: None,
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(
+            same_family,
+            Err(StoreError::Core(CoreError::SameFamilyForbidden { .. }))
+        ));
+
+        let accepted = store
+            .update_requirement_stage(
+                &gemini_acceptor.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-family-gate".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::A,
+                    evidence_ref: "verified cross-family".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("cross-family bound acceptor succeeds");
+        assert_eq!(accepted.stage, ReqStage::A);
+        assert_eq!(accepted.acceptor_family.as_deref(), Some("google-gemini"));
+    }
+
+    #[test]
+    fn save_sync_report_computes_server_verdict_and_ignores_forged_pass() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let worker = seed_agent_grant_with_family(
+            &store,
+            "sync-worker",
+            "cred-sync-w",
+            vec!["*".to_string()],
+            Some("openai-codex"),
+        );
+        let acceptor = seed_agent_grant_with_family(
+            &store,
+            "sync-acceptor",
+            "cred-sync-a",
+            vec!["*".to_string()],
+            Some("google-gemini"),
+        );
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        store.ack_rules(&owner.grant_id, &rules_sha).unwrap();
+        store.ack_rules(&worker.grant_id, &rules_sha).unwrap();
+        store.ack_rules(&acceptor.grant_id, &rules_sha).unwrap();
+
+        store
+            .create_trio_project(
+                &owner.grant_id,
+                CreateTrioProjectRequest {
+                    project_id: "proj-sync-verify".to_string(),
+                    create_id: None,
+                    title: "Sync Verify".to_string(),
+                    assessment: sample_assessment(),
+                    opt_in_modules: Vec::new(),
+                    initial_own_decisions: vec![OwnDecisionInput {
+                        own_id: "OWN-001".to_string(),
+                        statement: "Loopback only".to_string(),
+                    }],
+                    initial_requirements: vec![RequirementRowInput {
+                        req_id: "REQ-01".to_string(),
+                        source_id: "OWN-001".to_string(),
+                        statement: "Bind 127.0.0.1".to_string(),
+                    }],
+                },
+            )
+            .expect("create project");
+        store
+            .lock_project_plan(&owner.grant_id, "proj-sync-verify", None)
+            .expect("lock plan");
+        store
+            .update_requirement_stage(
+                &worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-sync-verify".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::T,
+                    evidence_ref: "tested".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark T");
+        store
+            .update_requirement_stage(
+                &acceptor.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-sync-verify".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::A,
+                    evidence_ref: "accepted".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark A");
+
+        let forged_attempt = store
+            .save_sync_report(
+                &acceptor.grant_id,
+                SaveSyncReportRequest {
+                    project_id: "proj-sync-verify".to_string(),
+                    plan_rev: 99,
+                    asbuilt_rev: 99,
+                    paired_rows: vec![PairedSyncRow {
+                        req_id: "REQ-01".to_string(),
+                        planned: "forged".to_string(),
+                        observed: "forged".to_string(),
+                        stage: ReqStage::A,
+                        matched: true,
+                    }],
+                    verdict: SyncVerdict::Pass,
+                    acceptor_family: "forged-family".to_string(),
+                },
+            )
+            .expect("computes server verdict instead of trusting forged payload");
+        assert_eq!(forged_attempt.verdict, SyncVerdict::Fail);
+        assert_eq!(forged_attempt.plan_rev, 1);
+        assert_eq!(forged_attempt.asbuilt_rev, 1);
+        assert_eq!(forged_attempt.acceptor_family, "google-gemini");
+        assert_eq!(forged_attempt.paired_rows.len(), 1);
+        assert!(!forged_attempt.paired_rows[0].matched);
+
+        let same_family_sync =
+            store.compute_and_save_sync_report(&worker.grant_id, "proj-sync-verify", None);
+        assert!(matches!(
+            same_family_sync,
+            Err(StoreError::Core(CoreError::SameFamilyForbidden { .. }))
+        ));
+
+        store
+            .save_resource(
+                &worker.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "proj-sync-verify-as_built".to_string(),
+                    title: "Sync Verify: as_built".to_string(),
+                    body_md: "# As Built\n\n| REQ-01 | A | Bound 127.0.0.1 | test:loopback |\n"
+                        .to_string(),
+                    project_id: Some("proj-sync-verify".to_string()),
+                    trio_role: Some("as_built".to_string()),
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Document REQ-01 in as_built".to_string(),
+                    expected_rev: Some(1),
+                },
+            )
+            .expect("update as_built");
+
+        let real_pass = store
+            .compute_and_save_sync_report(&acceptor.grant_id, "proj-sync-verify", None)
+            .expect("compute real pass");
+        assert_eq!(real_pass.verdict, SyncVerdict::Pass);
+        assert_eq!(real_pass.asbuilt_rev, 2);
+        assert!(real_pass.paired_rows[0].matched);
+    }
+
+    #[test]
+    fn upsert_requirement_row_and_stage_reset_clear_prior_acceptance() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let worker = seed_agent_grant_with_family(
+            &store,
+            "req-worker",
+            "cred-req-w",
+            vec!["*".to_string()],
+            Some("openai-codex"),
+        );
+        let acceptor = seed_agent_grant_with_family(
+            &store,
+            "req-acceptor",
+            "cred-req-a",
+            vec!["*".to_string()],
+            Some("google-gemini"),
+        );
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        store.ack_rules(&owner.grant_id, &rules_sha).unwrap();
+        store.ack_rules(&worker.grant_id, &rules_sha).unwrap();
+        store.ack_rules(&acceptor.grant_id, &rules_sha).unwrap();
+
+        store
+            .create_trio_project(
+                &owner.grant_id,
+                CreateTrioProjectRequest {
+                    project_id: "proj-req-reset".to_string(),
+                    create_id: None,
+                    title: "Req Reset".to_string(),
+                    assessment: sample_assessment(),
+                    opt_in_modules: Vec::new(),
+                    initial_own_decisions: Vec::new(),
+                    initial_requirements: vec![RequirementRowInput {
+                        req_id: "REQ-01".to_string(),
+                        source_id: "OWN-001".to_string(),
+                        statement: "Original statement".to_string(),
+                    }],
+                },
+            )
+            .expect("create project");
+
+        store
+            .update_requirement_stage(
+                &worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-req-reset".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::T,
+                    evidence_ref: "test-ok".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark T");
+        let accepted = store
+            .update_requirement_stage(
+                &acceptor.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-req-reset".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::A,
+                    evidence_ref: "accept-ok".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark A");
+        assert_eq!(accepted.stage, ReqStage::A);
+        assert_eq!(accepted.acceptor_family.as_deref(), Some("google-gemini"));
+
+        let same_def = store
+            .upsert_requirement_row(
+                &owner.grant_id,
+                "proj-req-reset",
+                "REQ-01",
+                "OWN-001",
+                "Original statement",
+            )
+            .expect("identical upsert preserves stage");
+        assert_eq!(same_def.stage, ReqStage::A);
+
+        let changed_def = store
+            .upsert_requirement_row(
+                &owner.grant_id,
+                "proj-req-reset",
+                "REQ-01",
+                "OWN-001",
+                "Changed requirement statement",
+            )
+            .expect("changed statement resets stage");
+        assert_eq!(changed_def.stage, ReqStage::D);
+        assert_eq!(changed_def.evidence_ref, "");
+        assert_eq!(changed_def.builder_principal, None);
+        assert_eq!(changed_def.builder_family, None);
+        assert_eq!(changed_def.acceptor_principal, None);
+        assert_eq!(changed_def.acceptor_family, None);
+
+        store
+            .update_requirement_stage(
+                &worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-req-reset".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::I,
+                    evidence_ref: "impl-ref".to_string(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark I");
+        let reset_stage = store
+            .update_requirement_stage(
+                &worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "proj-req-reset".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::D,
+                    evidence_ref: String::new(),
+                    actor_family: None,
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("reset stage to D");
+        assert_eq!(reset_stage.stage, ReqStage::D);
+        assert_eq!(reset_stage.evidence_ref, "");
+        assert_eq!(reset_stage.builder_principal, None);
+        assert_eq!(reset_stage.builder_family, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_sync_rejects_symlinks_without_reading_or_writing_outside_target() {
+        let dir = TempDirGuard::new("streamline-vault-symlink");
+        let db_path = dir.path.join("streamline.sqlite3");
+        let vault_dir = dir.path.join("vault");
+        let outside_file = dir.path.join("outside.txt");
+        fs::write(&outside_file, "DO_NOT_READ_OR_OVERWRITE\n").expect("write outside");
+
+        let store = StreamlineStore::open(&db_path).expect("open store");
+        let owner = seed_owner_grant(&store);
+
+        let standards_dir = vault_dir.join("standards");
+        fs::create_dir_all(&standards_dir).expect("create standards dir");
+        std::os::unix::fs::symlink(&outside_file, standards_dir.join("escape.md"))
+            .expect("plant symlink");
+
+        let err = store.sync_vault_dir(&vault_dir);
+        assert!(matches!(
+            err,
+            Err(StoreError::InvalidInput(ref msg)) if msg.contains("symlink")
+        ));
+        assert!(store
+            .read_resource(&owner.grant_id, "standards", "escape")
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(&outside_file).expect("read outside"),
+            "DO_NOT_READ_OR_OVERWRITE\n"
         );
     }
 }

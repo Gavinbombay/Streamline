@@ -28,9 +28,7 @@ pub fn stage_readonly_inputs(
     let mut planned = Vec::with_capacity(input_paths.len());
 
     for raw_path in input_paths {
-        if fs::metadata(raw_path).is_err() {
-            return Err(ConveyorError::MissingInput(raw_path.display().to_string()));
-        }
+        verify_no_symlink_components(raw_path)?;
         let base_name = resolve_input_basename(raw_path)?;
         if !seen_basenames.insert(base_name.clone()) {
             return Err(ConveyorError::StageFailure(format!(
@@ -44,8 +42,7 @@ pub fn stage_readonly_inputs(
     let inputs_dir = stage_dir.join("INPUTS");
     if inputs_dir.exists() {
         unfreeze_readonly_dir(&inputs_dir)?;
-        fs::remove_dir_all(&inputs_dir)
-            .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        fs::remove_dir_all(&inputs_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
     }
     fs::create_dir_all(&inputs_dir).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
 
@@ -96,8 +93,7 @@ pub(crate) fn freeze_readonly_tree(path: &Path) -> Result<(), ConveyorError> {
             return Ok(());
         }
         if meta.is_dir() {
-            let rd =
-                fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+            let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
                 freeze_readonly_tree(&entry.path())?;
@@ -120,8 +116,7 @@ pub(crate) fn freeze_readonly_tree(path: &Path) -> Result<(), ConveyorError> {
             return Ok(());
         }
         if meta.is_dir() {
-            let rd =
-                fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+            let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
                 freeze_readonly_tree(&entry.path())?;
@@ -129,8 +124,7 @@ pub(crate) fn freeze_readonly_tree(path: &Path) -> Result<(), ConveyorError> {
         }
         let mut perms = meta.permissions();
         perms.set_readonly(true);
-        fs::set_permissions(path, perms)
-            .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        fs::set_permissions(path, perms).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
     }
 
     Ok(())
@@ -155,6 +149,31 @@ pub fn compute_tree_manifest(root: &Path) -> Result<StagedManifest, ConveyorErro
         file_count: entries.len(),
         entries,
     })
+}
+
+/// Verifies that `path` and, when it is a directory, all of its walked
+/// children are free of symbolic links.
+pub fn verify_no_symlink_components(path: &Path) -> Result<(), ConveyorError> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ConveyorError::MissingInput(path.display().to_string())
+        } else {
+            ConveyorError::StageFailure(err.to_string())
+        }
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(ConveyorError::StageFailure(
+            "symlinks are forbidden in staged inputs".to_string(),
+        ));
+    }
+    if meta.is_dir() {
+        let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        for entry in rd {
+            let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+            verify_no_symlink_components(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Verifies no stray build or virtual-environment directories remain in a scratch tree.
@@ -183,8 +202,7 @@ fn unfreeze_recursive(path: &Path, is_root: bool) -> Result<(), ConveyorError> {
         if meta.is_dir() {
             fs::set_permissions(path, fs::Permissions::from_mode(0o755))
                 .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-            let rd =
-                fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+            let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
                 unfreeze_recursive(&entry.path(), false)?;
@@ -211,11 +229,9 @@ fn unfreeze_recursive(path: &Path, is_root: bool) -> Result<(), ConveyorError> {
         }
         let mut perms = meta.permissions();
         perms.set_readonly(false);
-        fs::set_permissions(path, perms)
-            .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        fs::set_permissions(path, perms).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
         if meta.is_dir() {
-            let rd =
-                fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+            let rd = fs::read_dir(path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             for entry in rd {
                 let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
                 unfreeze_recursive(&entry.path(), false)?;
@@ -258,7 +274,12 @@ fn resolve_input_basename(path: &Path) -> Result<String, ConveyorError> {
 }
 
 fn copy_staged_entry(src: &Path, dst: &Path) -> Result<(), ConveyorError> {
-    let meta = fs::metadata(src).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    let meta = fs::symlink_metadata(src).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+    if meta.file_type().is_symlink() {
+        return Err(ConveyorError::StageFailure(
+            "symlinks are forbidden in staged inputs".to_string(),
+        ));
+    }
     if meta.is_dir() {
         copy_dir_recursive(src, dst)
     } else if meta.is_file() {
@@ -289,21 +310,14 @@ fn copy_dir_recursive(src_dir: &Path, dst_dir: &Path) -> Result<(), ConveyorErro
         let link_meta = fs::symlink_metadata(&child_src)
             .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
         let ft = link_meta.file_type();
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            return Err(ConveyorError::StageFailure(
+                "symlinks are forbidden in staged inputs".to_string(),
+            ));
+        } else if ft.is_dir() {
             copy_dir_recursive(&child_src, &child_dst)?;
         } else if ft.is_file() {
             copy_single_file(&child_src, &child_dst, &link_meta)?;
-        } else if ft.is_symlink() {
-            let target_meta = fs::metadata(&child_src)
-                .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
-            if target_meta.is_file() {
-                copy_single_file(&child_src, &child_dst, &target_meta)?;
-            } else {
-                return Err(ConveyorError::StageFailure(format!(
-                    "symlinks to directories are not supported in staged inputs: '{}'",
-                    child_src.display()
-                )));
-            }
         }
     }
 
@@ -354,9 +368,16 @@ fn collect_files(
         if name == "SHA256SUMS" || name == ".git" {
             continue;
         }
-        if path.is_dir() {
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        if meta.file_type().is_symlink() {
+            return Err(ConveyorError::StageFailure(
+                "symlinks are forbidden in manifest trees".to_string(),
+            ));
+        }
+        if meta.is_dir() {
             collect_files(root, &path, out)?;
-        } else if path.is_file() {
+        } else if meta.is_file() {
             let bytes = fs::read(&path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
             let digest = hex::encode(Sha256::digest(&bytes));
             let rel = path

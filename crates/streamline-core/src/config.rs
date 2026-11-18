@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,8 @@ pub struct StreamlineConfig {
     pub db_path: String,
     pub vault_sync_dir: String,
     pub runs_dir: String,
+    #[serde(default)]
+    pub allowed_input_roots: Vec<String>,
     pub public_safe_mode: bool,
     pub presence_plugin_dir: String,
     pub memory_sync_url: String,
@@ -42,6 +44,7 @@ impl Default for StreamlineConfig {
             db_path: "/var/lib/streamline/streamline.sqlite3".to_string(),
             vault_sync_dir: "/var/lib/streamline/vault".to_string(),
             runs_dir: "/var/lib/streamline/runs".to_string(),
+            allowed_input_roots: Vec::new(),
             public_safe_mode: true,
             presence_plugin_dir: String::new(),
             memory_sync_url: String::new(),
@@ -82,6 +85,28 @@ impl StreamlineConfig {
             }
         }
         Ok(Self::default())
+    }
+
+    /// Returns the effective list of allowed filesystem roots for conveyor
+    /// dispatch inputs. Uses `allowed_input_roots` when non-empty after
+    /// trimming, otherwise falls back to `[vault_sync_dir, runs_dir]`.
+    pub fn effective_allowed_input_roots(&self) -> Vec<PathBuf> {
+        let configured: Vec<PathBuf> = self
+            .allowed_input_roots
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !configured.is_empty() {
+            return configured;
+        }
+        [self.vault_sync_dir.as_str(), self.runs_dir.as_str()]
+            .into_iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect()
     }
 
     /// Returns the optional local Presence plugin directory when configured.

@@ -6,7 +6,7 @@ use streamline_core::{AuditEvent, FreshnessState, LifecycleTier, SourcePassport,
 use crate::error::StoreError;
 use crate::grants::{
     check_shelf_access_tx, current_rules_sha256_tx, grant_has_tag_access, load_active_grant_tx,
-    now_rfc3339, record_audit_tx, require_rules_acked_tx, sha256_hex,
+    missing_tag_for_scope, now_rfc3339, record_audit_tx, require_rules_acked_tx, sha256_hex,
 };
 use crate::lessons::load_lessons_tx;
 use crate::models::{
@@ -85,29 +85,25 @@ pub(crate) fn load_passport_tx(
 pub(crate) fn save_resource_tx(
     conn: &Connection,
     author_principal: &str,
+    grant: Option<&AccessGrant>,
     req: SaveResourceRequest,
 ) -> Result<ResourceWithPassport, StoreError> {
     let shelf_slug = validate_slug(&req.shelf_slug, "shelf_slug")?;
     let slug = validate_slug(&req.slug, "slug")?;
-    if req.title.trim().is_empty() {
-        return Err(StoreError::InvalidInput(
-            "resource title cannot be empty".to_string(),
-        ));
-    }
+    let dest_project_id = match req.project_id {
+        Some(raw_pid) => Some(validate_slug(&raw_pid, "project_id")?),
+        None => None,
+    };
 
-    let shelf_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM shelves WHERE slug = ?1)",
-        params![shelf_slug],
-        |row| row.get(0),
-    )?;
-    if !shelf_exists {
-        return Err(StoreError::NotFound(format!(
-            "shelf '{shelf_slug}' not found"
-        )));
-    }
+    let shelf_required_tag: String = conn
+        .query_row(
+            "SELECT required_tag FROM shelves WHERE slug = ?1",
+            params![shelf_slug],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::NotFound(format!("shelf '{shelf_slug}' not found")))?;
 
-    let sha256 = sha256_hex(req.body_md.as_bytes());
-    let now = now_rfc3339();
     let existing = conn
         .query_row(
             "SELECT id, shelf_slug, slug, project_id, trio_role, lifecycle_tier,
@@ -117,6 +113,48 @@ pub(crate) fn save_resource_tx(
             map_resource_row,
         )
         .optional()?;
+
+    if let Some(active_grant) = grant {
+        if let Some(ref prev) = existing {
+            if !grant_has_tag_access(
+                active_grant,
+                &shelf_slug,
+                &shelf_required_tag,
+                prev.project_id.as_deref(),
+            ) {
+                return Err(StoreError::ForbiddenTag {
+                    required_tag: missing_tag_for_scope(
+                        &shelf_slug,
+                        &shelf_required_tag,
+                        prev.project_id.as_deref(),
+                    ),
+                });
+            }
+        }
+        if !grant_has_tag_access(
+            active_grant,
+            &shelf_slug,
+            &shelf_required_tag,
+            dest_project_id.as_deref(),
+        ) {
+            return Err(StoreError::ForbiddenTag {
+                required_tag: missing_tag_for_scope(
+                    &shelf_slug,
+                    &shelf_required_tag,
+                    dest_project_id.as_deref(),
+                ),
+            });
+        }
+    }
+
+    if req.title.trim().is_empty() {
+        return Err(StoreError::InvalidInput(
+            "resource title cannot be empty".to_string(),
+        ));
+    }
+
+    let sha256 = sha256_hex(req.body_md.as_bytes());
+    let now = now_rfc3339();
 
     let resource_id = match existing {
         Some(prev) => {
@@ -131,7 +169,7 @@ pub(crate) fn save_resource_tx(
             let next_rev = prev.current_rev + 1;
             let next_tier = req.lifecycle_tier.unwrap_or(prev.lifecycle_tier);
             let next_triage = req.triage_state.unwrap_or(prev.triage_state);
-            let next_project = req.project_id.or(prev.project_id);
+            let next_project = dest_project_id.or(prev.project_id);
             let next_role = req.trio_role.or(prev.trio_role);
 
             conn.execute(
@@ -192,7 +230,7 @@ pub(crate) fn save_resource_tx(
                     new_id,
                     shelf_slug,
                     slug,
-                    req.project_id,
+                    dest_project_id,
                     req.trio_role,
                     tier.as_str(),
                     triage.as_str(),
@@ -784,8 +822,7 @@ impl StreamlineStore {
         if !grant.can_write {
             return Err(StoreError::ForbiddenWrite);
         }
-        check_shelf_access_tx(&tx, &grant, &req.shelf_slug, req.project_id.as_deref())?;
-        let saved = save_resource_tx(&tx, &grant.principal_id, req)?;
+        let saved = save_resource_tx(&tx, &grant.principal_id, Some(&grant), req)?;
         tx.commit()?;
         Ok(saved)
     }
@@ -882,6 +919,7 @@ impl StreamlineStore {
         let saved = save_resource_tx(
             &tx,
             &grant.principal_id,
+            Some(&grant),
             SaveResourceRequest {
                 shelf_slug: shelf_slug.to_string(),
                 slug: slug.to_string(),
@@ -1055,9 +1093,17 @@ impl StreamlineStore {
             })?;
 
         check_shelf_access_tx(&tx, &grant, shelf_slug, prev.project_id.as_deref())?;
+        let clean_target_project_id = match target_project_id {
+            Some(raw_pid) => {
+                let clean = validate_slug(&raw_pid, "target_project_id")?;
+                check_shelf_access_tx(&tx, &grant, shelf_slug, Some(&clean))?;
+                Some(clean)
+            }
+            None => None,
+        };
 
         let next_triage = triage_state.unwrap_or(prev.triage_state);
-        let next_project = target_project_id.or(prev.project_id);
+        let next_project = clean_target_project_id.or(prev.project_id);
         let now = now_rfc3339();
 
         tx.execute(

@@ -49,6 +49,8 @@ enum Command {
         dispatch: bool,
         #[arg(long, value_name = "GRANT_ID")]
         grant_id: Option<String>,
+        #[arg(long, value_name = "FAMILY")]
+        model_family: Option<String>,
     },
     /// Import records from a legacy SQLite catalog into dormant/legacy triage shelves.
     ImportLegacy {
@@ -210,6 +212,7 @@ struct InitGrantArgs {
     write: bool,
     dispatch: bool,
     grant_id: Option<String>,
+    model_family: Option<String>,
 }
 
 fn run_init_grant(config: &StreamlineConfig, args: InitGrantArgs) -> Result<()> {
@@ -250,6 +253,7 @@ fn run_init_grant(config: &StreamlineConfig, args: InitGrantArgs) -> Result<()> 
         can_write: args.write,
         can_dispatch: args.dispatch,
         expires_at: None,
+        model_family: args.model_family,
     })?;
 
     println!("{}", grant.grant_id);
@@ -293,6 +297,7 @@ async fn main() -> Result<()> {
             write,
             dispatch,
             grant_id,
+            model_family,
         } => run_init_grant(
             &config,
             InitGrantArgs {
@@ -304,6 +309,7 @@ async fn main() -> Result<()> {
                 write,
                 dispatch,
                 grant_id,
+                model_family,
             },
         ),
         Command::ImportLegacy { from } => run_import_legacy(&config, &from),

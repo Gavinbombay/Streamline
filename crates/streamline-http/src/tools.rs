@@ -16,8 +16,7 @@ use streamline_safe::inspect_text;
 use streamline_store::{
     compare_texts, AccessGrant, CreateTrioProjectRequest, OwnDecisionInput,
     RecordDivergenceRequest, RecordLessonRequest, RequirementRowInput, ResourceFilter,
-    SaveResourceRequest, SaveSyncReportRequest, StoreError, TrioProjectBundle,
-    UpdateRequirementStageRequest,
+    SaveResourceRequest, StoreError, TrioProjectBundle, UpdateRequirementStageRequest,
 };
 
 use crate::error::ApiError;
@@ -461,18 +460,14 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
         },
         McpToolDescriptor {
             name: "save_sync_report",
-            description: "Persist a cross-model check_sync verdict and paired row report.",
+            description: "Compute and persist a server-verified cross-model check_sync verdict and paired row report.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_id": { "type": "string" },
-                    "plan_rev": { "type": "integer" },
-                    "asbuilt_rev": { "type": "integer" },
-                    "paired_rows": { "type": "array", "items": { "type": "object" } },
-                    "verdict": { "type": "string", "enum": ["pass", "fail", "partial"] },
-                    "acceptor_family": { "type": "string" }
+                    "asbuilt_slug": { "type": "string" }
                 },
-                "required": ["project_id", "plan_rev", "asbuilt_rev", "paired_rows", "verdict", "acceptor_family"]
+                "required": ["project_id"]
             }),
         },
         McpToolDescriptor {
@@ -1120,23 +1115,14 @@ pub fn dispatch_tool(
         }
         "save_sync_report" => {
             let active_grant = require_grant(grant)?;
-            let req: SaveSyncReportRequest = parse_args(raw_args)?;
-            check_safe_segment("project_id", &req.project_id)?;
-            check_safe_text(
-                "acceptor_family",
-                &req.acceptor_family,
-                &state.redaction_policy,
+            let args: SaveSyncReportArgs = parse_args(raw_args)?;
+            check_safe_segment("project_id", &args.project_id)?;
+            check_optional_safe_segment("asbuilt_slug", args.asbuilt_slug.as_deref())?;
+            let saved = state.store.compute_and_save_sync_report(
+                &active_grant.grant_id,
+                &args.project_id,
+                args.asbuilt_slug.as_deref(),
             )?;
-            for row in &req.paired_rows {
-                check_safe_text("paired_rows.req_id", &row.req_id, &state.redaction_policy)?;
-                check_safe_text("paired_rows.planned", &row.planned, &state.redaction_policy)?;
-                check_safe_text(
-                    "paired_rows.observed",
-                    &row.observed,
-                    &state.redaction_policy,
-                )?;
-            }
-            let saved = state.store.save_sync_report(&active_grant.grant_id, req)?;
             Ok(serde_json::to_value(saved)?)
         }
         "get_sync_report" => {
@@ -1647,9 +1633,7 @@ fn handle_dispatch_run(
     let outcome: DispatchOutcome =
         execute_conveyor_blocking(&state.config, &req).map_err(map_conveyor_error)?;
 
-    state
-        .store
-        .upsert_conveyor_run(outcome.build_run.clone())?;
+    state.store.upsert_conveyor_run(outcome.build_run.clone())?;
     if let Some(ref accept_run) = outcome.accept_run {
         state.store.upsert_conveyor_run(accept_run.clone())?;
     }
@@ -1738,12 +1722,8 @@ fn handle_export_trajectory(
     let bundle = state
         .store
         .get_project_bundle(&checked_grant.grant_id, &args.project_id)?;
-    let trajectory_file = export_bundle_trajectory(
-        state,
-        &checked_grant.grant_id,
-        &bundle,
-        Path::new(runs_dir),
-    )?;
+    let trajectory_file =
+        export_bundle_trajectory(state, &checked_grant.grant_id, &bundle, Path::new(runs_dir))?;
     Ok(json!({
         "project_id": args.project_id,
         "trajectory_file": trajectory_file,
@@ -1955,6 +1935,13 @@ struct CheckSyncArgs {
     project_id: String,
     as_built_markdown: Option<String>,
     as_built_slug: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SaveSyncReportArgs {
+    project_id: String,
+    #[serde(alias = "as_built_slug")]
+    asbuilt_slug: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -39,12 +39,13 @@ fn make_test_state(config: StreamlineConfig) -> AppState {
     AppState::new(Arc::new(store), config, skills_dir)
 }
 
-fn seed_grant(
+fn seed_grant_with_family(
     store: &StreamlineStore,
     id: &str,
     role: PrincipalRole,
     raw_cred: &str,
     tags: Vec<String>,
+    model_family: Option<&str>,
 ) -> String {
     store
         .upsert_principal(id, id, role)
@@ -58,9 +59,20 @@ fn seed_grant(
             can_write: true,
             can_dispatch: true,
             expires_at: None,
+            model_family: model_family.map(str::to_string),
         })
         .expect("create grant")
         .grant_id
+}
+
+fn seed_grant(
+    store: &StreamlineStore,
+    id: &str,
+    role: PrincipalRole,
+    raw_cred: &str,
+    tags: Vec<String>,
+) -> String {
+    seed_grant_with_family(store, id, role, raw_cred, tags, None)
 }
 
 async fn read_json_body(resp: axum::response::Response) -> (StatusCode, Value) {
@@ -373,19 +385,21 @@ async fn full_three_part_closeout_gate_over_mcp() {
         owner_cred,
         vec!["*".to_string()],
     );
-    let worker_grant = seed_grant(
+    let worker_grant = seed_grant_with_family(
         &state.store,
         "worker-closeout",
         PrincipalRole::Agent,
         worker_cred,
         vec!["*".to_string()],
+        Some("openai-codex"),
     );
-    let acceptor_grant = seed_grant(
+    let acceptor_grant = seed_grant_with_family(
         &state.store,
         "acceptor-closeout",
         PrincipalRole::Agent,
         acceptor_cred,
         vec!["*".to_string()],
+        Some("google-gemini"),
     );
 
     state.store.ack_rules(&owner_grant, &rules_sha).unwrap();
@@ -858,6 +872,7 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
     let config = StreamlineConfig {
         runs_dir: runs_dir.display().to_string(),
         vault_sync_dir: vault_dir.display().to_string(),
+        allowed_input_roots: vec![input_dir.display().to_string()],
         harnesses: vec![
             HarnessSpec {
                 id: "codex-sh".to_string(),
@@ -898,19 +913,21 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
         owner_cred,
         vec!["*".to_string()],
     );
-    let worker_grant = seed_grant(
+    let worker_grant = seed_grant_with_family(
         &state.store,
         "worker-conveyor",
         PrincipalRole::Agent,
         worker_cred,
         vec!["*".to_string()],
+        Some("openai-codex"),
     );
-    let acceptor_grant = seed_grant(
+    let acceptor_grant = seed_grant_with_family(
         &state.store,
         "acceptor-conveyor",
         PrincipalRole::Agent,
         acceptor_cred,
         vec!["*".to_string()],
+        Some("google-gemini"),
     );
 
     state
@@ -927,6 +944,7 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
             can_write: true,
             can_dispatch: false,
             expires_at: None,
+            model_family: None,
         })
         .expect("create no_dispatch grant")
         .grant_id;
@@ -1046,7 +1064,10 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
     )
     .await;
     let (status_build_err, status_build_data) = parse_mcp_tool_text(&status_build_resp);
-    assert!(!status_build_err, "get_run_status build failed: {status_build_data}");
+    assert!(
+        !status_build_err,
+        "get_run_status build failed: {status_build_data}"
+    );
     assert_eq!(status_build_data["data"]["run_id"], build_run_id);
     assert_eq!(status_build_data["data"]["phase"], "build");
 
@@ -1076,7 +1097,10 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
     )
     .await;
     let (list_runs_err, list_runs_data) = parse_mcp_tool_text(&list_runs_resp);
-    assert!(!list_runs_err, "list_conveyor_runs failed: {list_runs_data}");
+    assert!(
+        !list_runs_err,
+        "list_conveyor_runs failed: {list_runs_data}"
+    );
     let runs_arr = list_runs_data["data"].as_array().expect("runs array");
     assert_eq!(runs_arr.len(), 2);
     assert!(runs_arr.iter().any(|r| r["run_id"] == build_run_id));
@@ -1182,8 +1206,7 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
     let traj_text = fs::read_to_string(&traj_path).expect("read trajectories.jsonl");
     let lines: Vec<&str> = traj_text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert!(!lines.is_empty(), "trajectories.jsonl must contain a line");
-    let first_entry: Value =
-        serde_json::from_str(lines[0]).expect("parse trajectory JSONL entry");
+    let first_entry: Value = serde_json::from_str(lines[0]).expect("parse trajectory JSONL entry");
     assert_eq!(first_entry["project_id"], "conveyor-demo");
 
     // Non-owner cannot call export_trajectory; owner can.
@@ -1206,7 +1229,10 @@ async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
     )
     .await;
     let (owner_export_err, owner_export_data) = parse_mcp_tool_text(&owner_export);
-    assert!(!owner_export_err, "export_trajectory failed: {owner_export_data}");
+    assert!(
+        !owner_export_err,
+        "export_trajectory failed: {owner_export_data}"
+    );
     assert_eq!(owner_export_data["data"]["project_id"], "conveyor-demo");
     assert!(owner_export_data["data"]["trajectory_file"]
         .as_str()
@@ -1245,7 +1271,10 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
         "data-view=\"lessons\"",
         "data-view=\"apps\"",
     ] {
-        assert!(html.contains(nav_tab), "UI missing navigation tab {nav_tab}");
+        assert!(
+            html.contains(nav_tab),
+            "UI missing navigation tab {nav_tab}"
+        );
     }
 
     // Verify DOC-PENDING-OWNER approval inbox, Dormant/Legacy triage controls, and Lock Plan beside Compare.
@@ -1267,7 +1296,10 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
         "Source Passport",
         "optional-modules-details",
     ] {
-        assert!(html.contains(expected), "UI missing interactive fragment {expected}");
+        assert!(
+            html.contains(expected),
+            "UI missing interactive fragment {expected}"
+        );
     }
 
     // Verify budget optional module is unchecked by default.
@@ -1281,8 +1313,432 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
     );
 
     // Verify zero external CDN script/link leaks and zero em/en dashes.
-    assert!(!html.contains("http://"), "UI must not reference http:// URLs");
-    assert!(!html.contains("https://"), "UI must not reference https:// CDN URLs");
+    assert!(
+        !html.contains("http://"),
+        "UI must not reference http:// URLs"
+    );
+    assert!(
+        !html.contains("https://"),
+        "UI must not reference https:// CDN URLs"
+    );
     assert!(!html.contains('\u{2014}'), "UI must not contain em dash");
     assert!(!html.contains('\u{2013}'), "UI must not contain en dash");
+}
+
+#[tokio::test]
+async fn http_and_mcp_security_regressions_enforced() {
+    let state = make_test_state(StreamlineConfig::default());
+    let rules_sha = state.store.current_rules_sha256().expect("rules sha");
+
+    let owner_cred = "cred-sec-owner";
+    let demo_cred = "cred-sec-demo";
+    let codex_worker_cred = "cred-sec-codex-w";
+    let codex_spoof_cred = "cred-sec-codex-s";
+    let gemini_acceptor_cred = "cred-sec-gemini-a";
+
+    let owner_grant = seed_grant(
+        &state.store,
+        "sec-owner",
+        PrincipalRole::Owner,
+        owner_cred,
+        vec!["*".to_string()],
+    );
+    let demo_grant = seed_grant(
+        &state.store,
+        "sec-demo",
+        PrincipalRole::Agent,
+        demo_cred,
+        vec!["project:demo".to_string()],
+    );
+    let codex_worker_grant = seed_grant_with_family(
+        &state.store,
+        "sec-codex-worker",
+        PrincipalRole::Agent,
+        codex_worker_cred,
+        vec!["*".to_string()],
+        Some("openai-codex"),
+    );
+    let codex_spoof_grant = seed_grant_with_family(
+        &state.store,
+        "sec-codex-spoof",
+        PrincipalRole::Agent,
+        codex_spoof_cred,
+        vec!["*".to_string()],
+        Some("openai-codex"),
+    );
+    let gemini_acceptor_grant = seed_grant_with_family(
+        &state.store,
+        "sec-gemini-acceptor",
+        PrincipalRole::Agent,
+        gemini_acceptor_cred,
+        vec!["*".to_string()],
+        Some("google-gemini"),
+    );
+
+    for gid in [
+        &owner_grant,
+        &demo_grant,
+        &codex_worker_grant,
+        &codex_spoof_grant,
+        &gemini_acceptor_grant,
+    ] {
+        state.store.ack_rules(gid, &rules_sha).unwrap();
+    }
+
+    let app = build_router(state);
+
+    // Seed a project:other resource via REST.
+    let seed_other_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/save_resource")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {owner_cred}"))
+        .body(Body::from(
+            json!({
+                "shelf_slug": "projects",
+                "slug": "other-bounded",
+                "title": "Other Project Doc",
+                "body_md": "Original other content.",
+                "project_id": "other",
+                "summary": "Seed other doc"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (seed_status, _) = read_json_body(app.clone().oneshot(seed_other_req).await.unwrap()).await;
+    assert_eq!(seed_status, StatusCode::OK);
+
+    // 1. project:demo agent overwriting project:other resource must receive 403 FORBIDDEN.
+    let hijack_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/save_resource")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {demo_cred}"))
+        .body(Body::from(
+            json!({
+                "shelf_slug": "projects",
+                "slug": "other-bounded",
+                "title": "Hijacked Title",
+                "body_md": "Hijacked body.",
+                "project_id": "demo",
+                "summary": "Cross-project overwrite"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let (hijack_status, hijack_body) =
+        read_json_body(app.clone().oneshot(hijack_req).await.unwrap()).await;
+    assert_eq!(hijack_status, StatusCode::FORBIDDEN);
+    assert_eq!(hijack_body["error"]["code"], "FORBIDDEN");
+
+    // Create R2+ project over MCP.
+    let create_resp = mcp_call(
+        &app,
+        Some(owner_cred),
+        201,
+        "create_trio_project",
+        json!({
+            "project_id": "sec-proj",
+            "request_id": "req-sec-001",
+            "title": "Security Regression Demo",
+            "assessment": {
+                "d1_scope": 2,
+                "d2_interfaces": 1,
+                "d3_uncertainty": 1,
+                "d4_ui": 0,
+                "d5_novelty": 1,
+                "r1_exposure": 2,
+                "r2_irreversibility": 1,
+                "r3_blast_radius": 1,
+                "r4_evidence": 1,
+                "r5_custody": 1,
+                "work_kind": "software"
+            },
+            "initial_own_decisions": [
+                { "own_id": "OWN-001", "statement": "Use loopback 127.0.0.1" }
+            ],
+            "initial_requirements": [
+                { "req_id": "REQ-01", "source_id": "OWN-001", "statement": "Bind loopback only" }
+            ]
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&create_resp).0);
+
+    // 2. lock_project_plan with nonexistent revision 999 must be rejected without locking OWN.
+    let bad_lock = mcp_call(
+        &app,
+        Some(owner_cred),
+        202,
+        "lock_project_plan",
+        json!({ "project_id": "sec-proj", "plan_rev": 999 }),
+    )
+    .await;
+    assert!(parse_mcp_tool_text(&bad_lock).0);
+
+    let edit_own_after_bad_lock = mcp_call(
+        &app,
+        Some(owner_cred),
+        203,
+        "upsert_own_decision",
+        json!({
+            "project_id": "sec-proj",
+            "own_id": "OWN-001",
+            "statement": "Use loopback 127.0.0.1:5880"
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&edit_own_after_bad_lock).0);
+
+    let good_lock = mcp_call(
+        &app,
+        Some(owner_cred),
+        204,
+        "lock_project_plan",
+        json!({ "project_id": "sec-proj" }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&good_lock).0);
+
+    // 3. Advance REQ-01 to T (openai-codex), then reject spoofed actor_family on A.
+    let req_t = mcp_call(
+        &app,
+        Some(codex_worker_cred),
+        205,
+        "update_requirement_stage",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "target_stage": "T",
+            "evidence_ref": "tests passed"
+        }),
+    )
+    .await;
+    let (req_t_err, req_t_data) = parse_mcp_tool_text(&req_t);
+    assert!(!req_t_err, "req T failed: {req_t_data}");
+    assert_eq!(req_t_data["data"]["builder_family"], "openai-codex");
+
+    let spoof_a = mcp_call(
+        &app,
+        Some(codex_spoof_cred),
+        206,
+        "update_requirement_stage",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "target_stage": "A",
+            "evidence_ref": "spoofed qc",
+            "actor_family": "google-gemini"
+        }),
+    )
+    .await;
+    assert!(parse_mcp_tool_text(&spoof_a).0);
+
+    let real_a = mcp_call(
+        &app,
+        Some(gemini_acceptor_cred),
+        207,
+        "update_requirement_stage",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "target_stage": "A",
+            "evidence_ref": "cross-family verified"
+        }),
+    )
+    .await;
+    let (real_a_err, real_a_data) = parse_mcp_tool_text(&real_a);
+    assert!(!real_a_err, "real A failed: {real_a_data}");
+    assert_eq!(real_a_data["data"]["stage"], "A");
+    assert_eq!(real_a_data["data"]["acceptor_family"], "google-gemini");
+
+    // 4. save_sync_report computes Fail before as_built documents REQ-01, ignoring forged pass.
+    let forged_sync = mcp_call(
+        &app,
+        Some(gemini_acceptor_cred),
+        208,
+        "save_sync_report",
+        json!({
+            "project_id": "sec-proj",
+            "plan_rev": 1,
+            "asbuilt_rev": 1,
+            "verdict": "pass",
+            "acceptor_family": "google-gemini",
+            "paired_rows": [
+                { "req_id": "REQ-01", "planned": "x", "observed": "y", "stage": "A", "matched": true }
+            ]
+        }),
+    )
+    .await;
+    let (forged_sync_err, forged_sync_data) = parse_mcp_tool_text(&forged_sync);
+    assert!(
+        !forged_sync_err,
+        "save_sync_report failed: {forged_sync_data}"
+    );
+    assert_eq!(forged_sync_data["data"]["verdict"], "fail");
+    assert_eq!(forged_sync_data["data"]["paired_rows"][0]["matched"], false);
+
+    // Document REQ-01 in as_built, then save_sync_report computes real Pass.
+    let save_asbuilt = mcp_call(
+        &app,
+        Some(codex_worker_cred),
+        209,
+        "save_resource",
+        json!({
+            "shelf_slug": "projects",
+            "slug": "sec-proj-as_built",
+            "title": "Security Regression Demo: as_built",
+            "body_md": "# As Built\n\n| REQ-01 | A | Bound 127.0.0.1:5880 | test:ok |\n",
+            "project_id": "sec-proj",
+            "trio_role": "as_built",
+            "summary": "Document REQ-01",
+            "expected_rev": 1
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&save_asbuilt).0);
+
+    let real_sync = mcp_call(
+        &app,
+        Some(gemini_acceptor_cred),
+        210,
+        "save_sync_report",
+        json!({ "project_id": "sec-proj" }),
+    )
+    .await;
+    let (real_sync_err, real_sync_data) = parse_mcp_tool_text(&real_sync);
+    assert!(
+        !real_sync_err,
+        "real save_sync_report failed: {real_sync_data}"
+    );
+    assert_eq!(real_sync_data["data"]["verdict"], "pass");
+    assert_eq!(real_sync_data["data"]["asbuilt_rev"], 2);
+    assert_eq!(real_sync_data["data"]["paired_rows"][0]["matched"], true);
+
+    // 5. Updating requirement statement via upsert_requirement_row resets stage A -> D.
+    let reset_req = mcp_call(
+        &app,
+        Some(owner_cred),
+        211,
+        "upsert_requirement_row",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "source_id": "OWN-001",
+            "statement": "Bind loopback 127.0.0.1:5880 with TLS"
+        }),
+    )
+    .await;
+    let (reset_err, reset_data) = parse_mcp_tool_text(&reset_req);
+    assert!(!reset_err, "upsert_requirement_row failed: {reset_data}");
+    assert_eq!(reset_data["data"]["stage"], "D");
+    assert!(reset_data["data"]["acceptor_family"].is_null());
+    assert!(reset_data["data"]["builder_family"].is_null());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn skills_zip_and_presence_plugin_reject_symlinks_and_body_cap_enforced() {
+    let temp = TempDirGuard::new("streamline-http-symlinks");
+    let outside_file = temp.path.join("outside.txt");
+    fs::write(&outside_file, "OUTSIDE_SENTINEL_CONTENT\n").expect("write outside");
+
+    // 1. Symlinked skill file must be ignored and replaced by embedded fallback.
+    let skills_root = temp.path.join("skills");
+    let dir_skill = skills_root.join("streamline-director");
+    fs::create_dir_all(&dir_skill).expect("create director skill dir");
+    std::os::unix::fs::symlink(&outside_file, dir_skill.join("SKILL.md"))
+        .expect("plant skill symlink");
+
+    let zip_bytes = crate::zip_skills::build_skills_zip(&skills_root);
+    let zip_text = String::from_utf8_lossy(&zip_bytes);
+    assert!(
+        !zip_text.contains("OUTSIDE_SENTINEL_CONTENT"),
+        "build_skills_zip must never read outside symlink target"
+    );
+    assert!(zip_text.contains("streamline-director/SKILL.md"));
+
+    // 2. Symlinked presence_plugin_dir must not be served and oversized body must hit 413.
+    let real_plugin_target = temp.path.join("real-plugin");
+    fs::create_dir_all(&real_plugin_target).expect("create real plugin target");
+    fs::write(
+        real_plugin_target.join("presence.js"),
+        "export function mountPresence() { return 'escape'; }\n",
+    )
+    .expect("write plugin js");
+    let symlink_plugin = temp.path.join("plugin-link");
+    std::os::unix::fs::symlink(&real_plugin_target, &symlink_plugin)
+        .expect("plant plugin dir symlink");
+
+    let store = StreamlineStore::open_in_memory().expect("open store");
+    let config = StreamlineConfig {
+        presence_plugin_dir: symlink_plugin.display().to_string(),
+        ..StreamlineConfig::default()
+    };
+    let app = build_router(AppState::new(Arc::new(store), config, skills_root.clone()));
+
+    let plugin_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_streamline/presence-plugin/presence.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plugin_resp.status(), StatusCode::NOT_FOUND);
+
+    // Nested symlink inside a real presence_plugin_dir must also return 404 NOT_FOUND.
+    std::os::unix::fs::symlink(&outside_file, real_plugin_target.join("escape.js"))
+        .expect("plant nested plugin symlink");
+    let real_plugin_app = build_router(AppState::new(
+        Arc::new(StreamlineStore::open_in_memory().expect("open store 2")),
+        StreamlineConfig {
+            presence_plugin_dir: real_plugin_target.display().to_string(),
+            ..StreamlineConfig::default()
+        },
+        skills_root.clone(),
+    ));
+    let nested_symlink_resp = real_plugin_app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_streamline/presence-plugin/escape.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested_symlink_resp.status(), StatusCode::NOT_FOUND);
+
+    let zip_http = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/downloads/streamline-skills.zip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(zip_http.status(), StatusCode::OK);
+    let http_zip_bytes = to_bytes(zip_http.into_body(), usize::MAX).await.unwrap();
+    assert!(!String::from_utf8_lossy(&http_zip_bytes).contains("OUTSIDE_SENTINEL_CONTENT"));
+
+    let oversized = vec![b'a'; 2 * 1024 * 1024 + 4096];
+    let limit_resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(oversized))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(limit_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS access_grants (
     can_dispatch INTEGER NOT NULL,
     acked_rules_sha256 TEXT,
     expires_at TEXT,
-    revoked_at TEXT
+    revoked_at TEXT,
+    model_family TEXT
 );
 
 CREATE TABLE IF NOT EXISTS shelves (
@@ -252,10 +253,24 @@ fn ensure_trio_closeout_columns(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn ensure_grant_columns(conn: &Connection) -> Result<(), StoreError> {
+    let mut existing = std::collections::BTreeSet::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(\"access_grants\")")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for item in rows {
+        existing.insert(item?.to_ascii_lowercase());
+    }
+    if !existing.contains("model_family") {
+        conn.execute("ALTER TABLE access_grants ADD COLUMN model_family TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Runs idempotent schema migrations, triggers, default shelves, and initial rules seeding.
 pub(crate) fn run_migrations(conn: &mut Connection) -> Result<(), StoreError> {
     conn.execute_batch(SCHEMA_SQL)?;
     ensure_trio_closeout_columns(conn)?;
+    ensure_grant_columns(conn)?;
 
     let tx = conn.transaction()?;
     for (slug, title, required_tag) in DEFAULT_SHELVES {

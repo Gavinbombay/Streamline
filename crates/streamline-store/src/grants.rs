@@ -59,6 +59,11 @@ fn is_expired(expires_at: Option<&str>) -> bool {
     }
 }
 
+fn normalize_optional_family(raw: Option<String>) -> Option<String> {
+    raw.map(|val| val.trim().to_string())
+        .filter(|val| !val.is_empty())
+}
+
 fn map_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccessGrant> {
     let granted_tags_json: String = row.get(4)?;
     let role_str: String = row.get(3)?;
@@ -68,6 +73,7 @@ fn map_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccessGrant> {
     let principal_role = role_str
         .parse::<PrincipalRole>()
         .unwrap_or(PrincipalRole::Guest);
+    let model_family = normalize_optional_family(row.get(10)?);
 
     Ok(AccessGrant {
         grant_id: row.get(0)?,
@@ -80,6 +86,7 @@ fn map_grant_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccessGrant> {
         acked_rules_sha256: row.get(7)?,
         expires_at: row.get(8)?,
         revoked_at: row.get(9)?,
+        model_family,
     })
 }
 
@@ -90,7 +97,8 @@ pub(crate) fn load_active_grant_tx(
     let grant = conn
         .query_row(
             "SELECT g.grant_id, g.principal_id, p.handle, p.role, g.granted_tags_json,
-                    g.can_write, g.can_dispatch, g.acked_rules_sha256, g.expires_at, g.revoked_at
+                    g.can_write, g.can_dispatch, g.acked_rules_sha256, g.expires_at,
+                    g.revoked_at, g.model_family
              FROM access_grants g
              JOIN principals p ON p.id = g.principal_id
              WHERE g.grant_id = ?1",
@@ -162,6 +170,19 @@ pub(crate) fn grant_has_tag_access(
     false
 }
 
+pub(crate) fn missing_tag_for_scope(
+    shelf_slug: &str,
+    required_tag: &str,
+    project_id: Option<&str>,
+) -> String {
+    if shelf_slug == "projects" {
+        if let Some(pid) = project_id {
+            return format!("project:{pid}");
+        }
+    }
+    required_tag.to_string()
+}
+
 pub(crate) fn check_shelf_access_tx(
     conn: &Connection,
     grant: &AccessGrant,
@@ -181,15 +202,7 @@ pub(crate) fn check_shelf_access_tx(
         return Ok(());
     }
 
-    let missing_tag = if shelf_slug == "projects" {
-        if let Some(pid) = project_id {
-            format!("project:{pid}")
-        } else {
-            required_tag
-        }
-    } else {
-        required_tag
-    };
+    let missing_tag = missing_tag_for_scope(shelf_slug, &required_tag, project_id);
     Err(StoreError::ForbiddenTag {
         required_tag: missing_tag,
     })
@@ -297,6 +310,7 @@ impl StreamlineStore {
             .unwrap_or_else(|| format!("grant-{}", uuid::Uuid::new_v4()));
         let credential_hash = sha256_hex(req.raw_credential.as_bytes());
         let tags_json = serde_json::to_string(&req.granted_tags)?;
+        let model_family = normalize_optional_family(req.model_family);
 
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
@@ -316,8 +330,8 @@ impl StreamlineStore {
         tx.execute(
             "INSERT INTO access_grants (
                 grant_id, principal_id, credential_hash, granted_tags_json,
-                can_write, can_dispatch, acked_rules_sha256, expires_at, revoked_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL)",
+                can_write, can_dispatch, acked_rules_sha256, expires_at, revoked_at, model_family
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, NULL, ?8)",
             params![
                 grant_id,
                 req.principal_id,
@@ -326,6 +340,7 @@ impl StreamlineStore {
                 if req.can_write { 1 } else { 0 },
                 if req.can_dispatch { 1 } else { 0 },
                 req.expires_at,
+                model_family,
             ],
         )
         .map_err(|err| match err {
@@ -347,6 +362,7 @@ impl StreamlineStore {
                 "granted_tags": req.granted_tags,
                 "can_write": req.can_write,
                 "can_dispatch": req.can_dispatch,
+                "model_family": model_family,
             }),
         )?;
 
@@ -365,7 +381,8 @@ impl StreamlineStore {
         let grant = conn
             .query_row(
                 "SELECT g.grant_id, g.principal_id, p.handle, p.role, g.granted_tags_json,
-                        g.can_write, g.can_dispatch, g.acked_rules_sha256, g.expires_at, g.revoked_at
+                        g.can_write, g.can_dispatch, g.acked_rules_sha256, g.expires_at,
+                        g.revoked_at, g.model_family
                  FROM access_grants g
                  JOIN principals p ON p.id = g.principal_id
                  WHERE g.credential_hash = ?1",

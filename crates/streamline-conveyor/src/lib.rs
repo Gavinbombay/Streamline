@@ -15,6 +15,6 @@ pub use runner::{
 };
 pub use staging::{
     compute_tree_manifest, stage_readonly_inputs, unfreeze_readonly_dir, verify_cleanup_clean,
-    StagedManifest,
+    verify_no_symlink_components, StagedManifest,
 };
 pub use trajectory::{append_trajectory_jsonl, TrajectoryExportInput};

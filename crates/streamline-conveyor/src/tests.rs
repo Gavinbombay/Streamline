@@ -3,7 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use chrono::DateTime;
-use streamline_core::{HarnessSpec, RunPhase, RunState, StreamlineConfig, SyncVerdict, TrioProfile};
+use streamline_core::{
+    HarnessSpec, RunPhase, RunState, StreamlineConfig, SyncVerdict, TrioProfile,
+};
 use streamline_safe::RedactionPolicy;
 
 use crate::{
@@ -35,18 +37,21 @@ fn sh_harness(id: &str, family: &str, script: &str) -> HarnessSpec {
     HarnessSpec {
         id: id.to_string(),
         family: family.to_string(),
-        command: vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            script.to_string(),
-        ],
+        command: vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
         max_concurrency: 1,
     }
 }
 
 fn base_config(runs_dir: &std::path::Path, harnesses: Vec<HarnessSpec>) -> StreamlineConfig {
+    let allowed_root = runs_dir
+        .parent()
+        .unwrap_or(runs_dir)
+        .to_string_lossy()
+        .into_owned();
     StreamlineConfig {
+        vault_sync_dir: allowed_root.clone(),
         runs_dir: runs_dir.to_string_lossy().into_owned(),
+        allowed_input_roots: vec![allowed_root],
         public_safe_mode: true,
         harnesses,
         ..StreamlineConfig::default()
@@ -166,7 +171,8 @@ fn readonly_staging_blocks_rogue_builder_mutation() {
         .join(&outcome.build_run.run_id)
         .join("stage")
         .join("INPUTS");
-    let observed_spec = fs::read_to_string(staged_inputs.join("spec.md")).expect("read staged spec");
+    let observed_spec =
+        fs::read_to_string(staged_inputs.join("spec.md")).expect("read staged spec");
     assert_eq!(observed_spec, "Original specification\n");
 
     let recomputed = compute_tree_manifest(&staged_inputs).expect("recompute staged manifest");
@@ -375,8 +381,7 @@ fn trajectory_export_writes_verified_jsonl_and_blocks_unsafe_text() {
     let lines: Vec<&str> = raw_contents.lines().collect();
     assert_eq!(lines.len(), 2);
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("parse first JSONL line");
+    let parsed: serde_json::Value = serde_json::from_str(lines[0]).expect("parse first JSONL line");
     assert_eq!(parsed["project_id"], "proj-alpha");
     assert_eq!(parsed["profile"], "P2");
     assert_eq!(parsed["sync_verdict"], "pass");
@@ -677,7 +682,187 @@ fn r2_preferred_same_family_acceptor_rejected_and_r1_allowed() {
     let ok = execute_conveyor_blocking(&cfg, &req_r1).expect("R1 same-family allowed");
     assert_eq!(ok.final_state, RunState::DocPendingOwner);
     assert_eq!(
-        ok.accept_run.as_ref().expect("accept_run present").harness_id,
+        ok.accept_run
+            .as_ref()
+            .expect("accept_run present")
+            .harness_id,
         "codex-b"
     );
+}
+
+#[test]
+fn input_path_outside_allowed_roots_is_blocked_at_impasse() {
+    let tmp = TempDirGuard::new("conveyor-outside-root");
+    let allowed_dir = tmp.path.join("allowed_inputs");
+    let outside_dir = tmp.path.join("outside_inputs");
+    let vault_dir = tmp.path.join("vault");
+    let runs_dir = tmp.path.join("runs");
+    fs::create_dir_all(&allowed_dir).expect("create allowed_inputs");
+    fs::create_dir_all(&outside_dir).expect("create outside_inputs");
+    fs::create_dir_all(&vault_dir).expect("create vault");
+
+    let outside_file = outside_dir.join("outside.txt");
+    fs::write(&outside_file, "OUTSIDE_PAYLOAD_DO_NOT_COPY\n").expect("write outside file");
+
+    let builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "printf 'ran\\n' > \"$STREAMLINE_WORK_DIR/ran.flag\"",
+    );
+    let cfg = StreamlineConfig {
+        vault_sync_dir: vault_dir.to_string_lossy().into_owned(),
+        runs_dir: runs_dir.to_string_lossy().into_owned(),
+        allowed_input_roots: vec![allowed_dir.to_string_lossy().into_owned()],
+        public_safe_mode: true,
+        harnesses: vec![builder],
+        ..StreamlineConfig::default()
+    };
+    let req = DispatchRequest {
+        project_id: "proj-outside-root".to_string(),
+        input_paths: vec![outside_file],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+    };
+
+    let outcome = execute_conveyor_blocking(&cfg, &req).expect("outside root returns Impasse");
+    assert_eq!(outcome.final_state, RunState::Impasse);
+    assert_eq!(outcome.build_run.state, RunState::Impasse);
+    assert!(outcome.accept_run.is_none());
+
+    let escalation = outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("escalation markdown present");
+    assert!(escalation.contains("INPUT_OUTSIDE_ALLOWED_ROOT"));
+
+    let run_dir = runs_dir.join(&outcome.build_run.run_id);
+    assert!(!run_dir.join("stage").join("INPUTS").exists());
+    assert!(!run_dir.join("work").join("ran.flag").exists());
+    assert!(run_dir.join("out").join("ESCALATION.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_input_path_is_rejected_without_copying() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDirGuard::new("conveyor-symlink-input");
+    let allowed_dir = tmp.path.join("allowed_inputs");
+    let outside_dir = tmp.path.join("outside_inputs");
+    let vault_dir = tmp.path.join("vault");
+    let runs_dir = tmp.path.join("runs");
+    fs::create_dir_all(&allowed_dir).expect("create allowed_inputs");
+    fs::create_dir_all(&outside_dir).expect("create outside_inputs");
+    fs::create_dir_all(&vault_dir).expect("create vault");
+
+    let outside_file = outside_dir.join("outside.txt");
+    fs::write(&outside_file, "SYMLINK_TARGET_DO_NOT_COPY\n").expect("write outside file");
+
+    let link_path = allowed_dir.join("link.txt");
+    symlink(&outside_file, &link_path).expect("create symlink input");
+
+    let builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "printf 'ran\\n' > \"$STREAMLINE_WORK_DIR/ran.flag\"",
+    );
+    let cfg = StreamlineConfig {
+        vault_sync_dir: vault_dir.to_string_lossy().into_owned(),
+        runs_dir: runs_dir.to_string_lossy().into_owned(),
+        allowed_input_roots: vec![allowed_dir.to_string_lossy().into_owned()],
+        public_safe_mode: true,
+        harnesses: vec![builder],
+        ..StreamlineConfig::default()
+    };
+    let req = DispatchRequest {
+        project_id: "proj-symlink-file".to_string(),
+        input_paths: vec![link_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+    };
+
+    let outcome = execute_conveyor_blocking(&cfg, &req).expect("symlink input returns Impasse");
+    assert_eq!(outcome.final_state, RunState::Impasse);
+    assert!(outcome.accept_run.is_none());
+    let escalation = outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("escalation markdown present");
+    assert!(escalation.contains("SYMLINK_INPUT_REJECTED"));
+
+    let run_dir = runs_dir.join(&outcome.build_run.run_id);
+    assert!(!run_dir.join("stage").join("INPUTS").exists());
+    assert!(!run_dir.join("work").join("ran.flag").exists());
+
+    let bundle_dir = allowed_dir.join("bundle");
+    fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+    fs::write(bundle_dir.join("clean.txt"), "clean\n").expect("write clean.txt");
+    symlink(&outside_file, bundle_dir.join("escape.txt")).expect("create nested symlink");
+
+    let req_bundle = DispatchRequest {
+        project_id: "proj-symlink-dir".to_string(),
+        input_paths: vec![bundle_dir],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+    };
+    let bundle_outcome =
+        execute_conveyor_blocking(&cfg, &req_bundle).expect("nested symlink returns Impasse");
+    assert_eq!(bundle_outcome.final_state, RunState::Impasse);
+    assert!(bundle_outcome
+        .escalation_markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("SYMLINK_INPUT_REJECTED"));
+    let bundle_run_dir = runs_dir.join(&bundle_outcome.build_run.run_id);
+    assert!(!bundle_run_dir.join("stage").join("INPUTS").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn trajectory_export_refuses_symlinked_target_and_runs_dir() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDirGuard::new("conveyor-trajectory-symlink");
+    let victim_file = tmp.path.join("victim.txt");
+    fs::write(&victim_file, "VICTIM_ORIGINAL_DATA\n").expect("write victim file");
+
+    let runs_dir = tmp.path.join("runs");
+    fs::create_dir_all(&runs_dir).expect("create runs_dir");
+    let symlink_target = runs_dir.join("trajectories.jsonl");
+    symlink(&victim_file, &symlink_target).expect("plant symlink at trajectories.jsonl");
+
+    let policy = RedactionPolicy {
+        public_safe_mode: true,
+    };
+    let input = TrajectoryExportInput {
+        project_id: "proj-symlink-traj".to_string(),
+        title: "Symlink Guard".to_string(),
+        profile: TrioProfile::P1,
+        own_statements: vec!["OWN-001: Safe check".to_string()],
+        div_summaries: vec![],
+        lesson_rules: vec![],
+        sync_verdict: Some(SyncVerdict::Pass),
+        how_it_works_sha256: None,
+    };
+
+    let err_target = append_trajectory_jsonl(&runs_dir, &policy, &input)
+        .expect_err("symlinked trajectories.jsonl must fail");
+    assert!(matches!(err_target, ConveyorError::StageFailure(_)));
+    assert_eq!(
+        fs::read_to_string(&victim_file).expect("read victim file"),
+        "VICTIM_ORIGINAL_DATA\n"
+    );
+
+    let outside_runs = tmp.path.join("outside_runs");
+    fs::create_dir_all(&outside_runs).expect("create outside_runs");
+    let symlink_runs_dir = tmp.path.join("runs_link");
+    symlink(&outside_runs, &symlink_runs_dir).expect("plant symlink at runs_dir");
+
+    let err_runs_dir = append_trajectory_jsonl(&symlink_runs_dir, &policy, &input)
+        .expect_err("symlinked runs_dir must fail");
+    assert!(matches!(err_runs_dir, ConveyorError::StageFailure(_)));
+    assert!(!outside_runs.join("trajectories.jsonl").exists());
 }

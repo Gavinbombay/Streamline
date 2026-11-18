@@ -10,6 +10,7 @@ import os
 import sys
 import glob
 import html
+import tempfile
 
 def render_svg(txt_content: str) -> str:
     lines = txt_content.splitlines()
@@ -73,6 +74,11 @@ def main():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "captures",
     )
+    
+    if os.path.islink(captures_dir):
+        print(f"Error: captures directory {captures_dir} is a symbolic link.", file=sys.stderr)
+        sys.exit(1)
+        
     if not os.path.exists(captures_dir):
         print(f"Captures directory {captures_dir} does not exist.")
         sys.exit(0)
@@ -83,12 +89,42 @@ def main():
         sys.exit(0)
         
     for txt_path in sorted(txt_files):
+        if os.path.islink(txt_path):
+            print(f"Error: capture file {txt_path} is a symbolic link.", file=sys.stderr)
+            sys.exit(1)
+            
         svg_path = os.path.splitext(txt_path)[0] + ".svg"
+        if os.path.islink(svg_path):
+            print(f"Error: output path {svg_path} is a symbolic link.", file=sys.stderr)
+            sys.exit(1)
         with open(txt_path, "r", encoding="utf-8") as f:
             content = f.read()
         svg_content = render_svg(content)
-        with open(svg_path, "w", encoding="utf-8") as f:
-            f.write(svg_content)
+        
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=captures_dir,
+                prefix=".capture-",
+                suffix=".svg.tmp",
+                delete=False,
+            ) as tmp:
+                tmp_name = tmp.name
+                tmp.write(svg_content)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.chmod(tmp_name, 0o644)
+            os.replace(tmp_name, svg_path)
+        except Exception:
+            if tmp_name and os.path.exists(tmp_name):
+                try:
+                    os.unlink(tmp_name)
+                except Exception:
+                    pass
+            raise
+            
         print(f"Rendered {os.path.basename(svg_path)}")
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use streamline_core::{
-    assess_work_with_modules, validate_how_it_works, validate_stage_transition, ConveyorRun,
-    Divergence, DivergenceStatus, LifecycleTier, OwnDecision, PrincipalRole, ReqStage,
-    RequirementRow, RunPhase, RunState, StageTransitionRequest, SyncVerdict, TriageState,
-    TrioProfile, WorkKind,
+    assess_work_with_modules, check_sync, validate_how_it_works, validate_stage_transition,
+    ConveyorRun, CoreError, Divergence, DivergenceStatus, LifecycleTier, OwnDecision,
+    PrincipalRole, ReqStage, RequirementRow, RunPhase, RunState, StageTransitionRequest,
+    SyncVerdict, TriageState, TrioProfile, WorkKind,
 };
 
 use crate::error::StoreError;
@@ -330,6 +330,7 @@ impl StreamlineStore {
             save_resource_tx(
                 &tx,
                 &grant.principal_id,
+                Some(&grant),
                 SaveResourceRequest {
                     shelf_slug: "projects".to_string(),
                     slug,
@@ -489,19 +490,70 @@ impl StreamlineStore {
         check_shelf_access_tx(&tx, &grant, "projects", Some(project_id))?;
 
         let project = load_project_tx(&tx, project_id)?;
+        let plan_resource: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT id, current_rev FROM resources
+                 WHERE project_id = ?1 AND trio_role IN ('blueprint', 'fix_record')
+                   AND deleted_at IS NULL
+                 ORDER BY current_rev DESC LIMIT 1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
         let resolved_rev = match plan_rev {
-            Some(rev) => rev,
-            None => tx
-                .query_row(
-                    "SELECT current_rev FROM resources
-                     WHERE project_id = ?1 AND trio_role IN ('blueprint', 'fix_record')
-                       AND deleted_at IS NULL
-                     ORDER BY current_rev DESC LIMIT 1",
-                    params![project_id],
+            Some(rev) => {
+                if rev < 1 {
+                    return Err(StoreError::InvalidInput(format!(
+                        "plan revision {rev} does not exist for project '{project_id}'"
+                    )));
+                }
+                let Some((plan_res_id, _)) = plan_resource else {
+                    return Err(StoreError::InvalidInput(format!(
+                        "plan revision {rev} does not exist for project '{project_id}'"
+                    )));
+                };
+                let rev_exists: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM resource_revisions
+                         WHERE resource_id = ?1 AND rev = ?2
+                     )",
+                    params![plan_res_id, rev],
                     |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or(1),
+                )?;
+                if !rev_exists {
+                    return Err(StoreError::InvalidInput(format!(
+                        "plan revision {rev} does not exist for project '{project_id}'"
+                    )));
+                }
+                rev
+            }
+            None => {
+                let Some((plan_res_id, current_rev)) = plan_resource else {
+                    return Err(StoreError::InvalidInput(format!(
+                        "plan revision does not exist for project '{project_id}'"
+                    )));
+                };
+                if current_rev < 1 {
+                    return Err(StoreError::InvalidInput(format!(
+                        "plan revision {current_rev} does not exist for project '{project_id}'"
+                    )));
+                }
+                let rev_exists: bool = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM resource_revisions
+                         WHERE resource_id = ?1 AND rev = ?2
+                     )",
+                    params![plan_res_id, current_rev],
+                    |row| row.get(0),
+                )?;
+                if !rev_exists {
+                    return Err(StoreError::InvalidInput(format!(
+                        "plan revision {current_rev} does not exist for project '{project_id}'"
+                    )));
+                }
+                current_rev
+            }
         };
 
         if let Some(existing_rev) = project.plan_locked_rev {
@@ -638,32 +690,79 @@ impl StreamlineStore {
         check_shelf_access_tx(&tx, &grant, "projects", Some(project_id))?;
         let _ = load_project_tx(&tx, project_id)?;
 
+        let trimmed_req_id = req_id.trim();
+        let trimmed_source_id = source_id.trim();
+        let trimmed_statement = statement.trim();
         let now = now_rfc3339();
-        tx.execute(
-            "INSERT INTO requirement_rows (
-                project_id, req_id, source_id, statement, stage, evidence_ref,
-                builder_principal, builder_family, acceptor_principal, acceptor_family, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, 'D', '', NULL, NULL, NULL, NULL, ?5)
-            ON CONFLICT(project_id, req_id) DO UPDATE SET
-                source_id = excluded.source_id,
-                statement = excluded.statement,
-                updated_at = excluded.updated_at",
-            params![
-                project_id,
-                req_id.trim(),
-                source_id.trim(),
-                statement.trim(),
-                now
-            ],
-        )?;
 
-        let saved = load_requirement_row_tx(&tx, project_id, req_id.trim())?;
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT source_id, statement FROM requirement_rows
+                 WHERE project_id = ?1 AND req_id = ?2",
+                params![project_id, trimmed_req_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        match existing {
+            Some((existing_source_id, existing_statement)) => {
+                if existing_source_id != trimmed_source_id
+                    || existing_statement != trimmed_statement
+                {
+                    tx.execute(
+                        "UPDATE requirement_rows
+                         SET source_id = ?1,
+                             statement = ?2,
+                             stage = 'D',
+                             evidence_ref = '',
+                             builder_principal = NULL,
+                             builder_family = NULL,
+                             acceptor_principal = NULL,
+                             acceptor_family = NULL,
+                             updated_at = ?3
+                         WHERE project_id = ?4 AND req_id = ?5",
+                        params![
+                            trimmed_source_id,
+                            trimmed_statement,
+                            now,
+                            project_id,
+                            trimmed_req_id,
+                        ],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE requirement_rows
+                         SET updated_at = ?1
+                         WHERE project_id = ?2 AND req_id = ?3",
+                        params![now, project_id, trimmed_req_id],
+                    )?;
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO requirement_rows (
+                        project_id, req_id, source_id, statement, stage, evidence_ref,
+                        builder_principal, builder_family, acceptor_principal, acceptor_family, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 'D', '', NULL, NULL, NULL, NULL, ?5)",
+                    params![
+                        project_id,
+                        trimmed_req_id,
+                        trimmed_source_id,
+                        trimmed_statement,
+                        now,
+                    ],
+                )?;
+            }
+        }
+
+        let saved = load_requirement_row_tx(&tx, project_id, trimmed_req_id)?;
         tx.commit()?;
         Ok(saved)
     }
 
     /// Advances a requirement row through `D -> I -> T -> A -> L`, enforcing role, evidence,
-    /// non-self acceptance, cross-family acceptance for `R2+`, and approved `HOW-IT-WORKS` for `L`.
+    /// non-self acceptance, server-derived grant model family, cross-family acceptance for `R2+`,
+    /// and approved `HOW-IT-WORKS` for `L`.
     pub fn update_requirement_stage(
         &self,
         grant_id: &str,
@@ -682,8 +781,66 @@ impl StreamlineStore {
         let how_it_works_approved =
             project.state == RunState::Done && project.how_it_works_resource_id.is_some();
 
+        let bound_family = grant
+            .model_family
+            .as_deref()
+            .map(str::trim)
+            .filter(|val| !val.is_empty())
+            .map(str::to_string);
+        let claimed_family = req
+            .actor_family
+            .as_deref()
+            .map(str::trim)
+            .filter(|val| !val.is_empty())
+            .map(str::to_string);
+
+        let effective_family: Option<String> = if grant.principal_role == PrincipalRole::Owner {
+            match (&bound_family, &claimed_family) {
+                (Some(bound), Some(claimed)) if !bound.eq_ignore_ascii_case(claimed) => {
+                    return Err(StoreError::ForbiddenRole(
+                        "caller cannot spoof model_family; grant is bound to a different family"
+                            .to_string(),
+                    ));
+                }
+                (Some(bound), _) => Some(bound.clone()),
+                (None, claimed) => claimed.clone(),
+            }
+        } else {
+            if let Some(ref claimed) = claimed_family {
+                let matches_bound = bound_family
+                    .as_deref()
+                    .map(|bound| bound.eq_ignore_ascii_case(claimed))
+                    .unwrap_or(false);
+                if !matches_bound {
+                    return Err(StoreError::ForbiddenRole(
+                        "caller cannot spoof model_family; grant is bound to a different family"
+                            .to_string(),
+                    ));
+                }
+            }
+            bound_family.clone()
+        };
+
+        if project.risk >= 2
+            && matches!(req.target_stage, ReqStage::I | ReqStage::T)
+            && effective_family.is_none()
+        {
+            return Err(StoreError::InvalidState(
+                "R2+ work requires grant bound to a trusted model_family".to_string(),
+            ));
+        }
+        if project.risk >= 2
+            && req.target_stage == ReqStage::A
+            && grant.principal_role != PrincipalRole::Owner
+            && bound_family.is_none()
+        {
+            return Err(StoreError::InvalidState(
+                "R2+ work requires grant bound to a trusted model_family".to_string(),
+            ));
+        }
+
         let (builder_family, acceptor_family) = match req.target_stage {
-            ReqStage::A => (existing.builder_family.clone(), req.actor_family.clone()),
+            ReqStage::A => (existing.builder_family.clone(), effective_family.clone()),
             _ => (
                 existing.builder_family.clone(),
                 existing.acceptor_family.clone(),
@@ -718,7 +875,7 @@ impl StreamlineStore {
                         req.target_stage.as_str(),
                         req.evidence_ref.trim(),
                         grant.principal_id,
-                        req.actor_family,
+                        effective_family,
                         now,
                         req.project_id,
                         req.req_id,
@@ -736,25 +893,33 @@ impl StreamlineStore {
                     params![
                         req.evidence_ref.trim(),
                         grant.principal_id,
-                        req.actor_family,
+                        effective_family,
                         now,
                         req.project_id,
                         req.req_id,
                     ],
                 )?;
             }
-            _ => {
+            ReqStage::D | ReqStage::Unknown => {
                 tx.execute(
                     "UPDATE requirement_rows
-                     SET stage = ?1, evidence_ref = ?2, updated_at = ?3
-                     WHERE project_id = ?4 AND req_id = ?5",
-                    params![
-                        req.target_stage.as_str(),
-                        req.evidence_ref.trim(),
-                        now,
-                        req.project_id,
-                        req.req_id,
-                    ],
+                     SET stage = ?1,
+                         evidence_ref = '',
+                         builder_principal = NULL,
+                         builder_family = NULL,
+                         acceptor_principal = NULL,
+                         acceptor_family = NULL,
+                         updated_at = ?2
+                     WHERE project_id = ?3 AND req_id = ?4",
+                    params![req.target_stage.as_str(), now, req.project_id, req.req_id,],
+                )?;
+            }
+            ReqStage::L => {
+                tx.execute(
+                    "UPDATE requirement_rows
+                     SET stage = 'L', evidence_ref = ?1, updated_at = ?2
+                     WHERE project_id = ?3 AND req_id = ?4",
+                    params![req.evidence_ref.trim(), now, req.project_id, req.req_id,],
                 )?;
             }
         }
@@ -776,17 +941,23 @@ impl StreamlineStore {
         Ok(updated)
     }
 
-    /// Saves a validated cross-model sync report for a Trio+ project.
-    pub fn save_sync_report(
+    /// Computes paired rows and verdict server-side against the project's locked plan and
+    /// `as_built` resource, derives `acceptor_family` from the authenticated grant, and persists
+    /// the resulting `SyncReport`.
+    pub fn compute_and_save_sync_report(
         &self,
         grant_id: &str,
-        req: SaveSyncReportRequest,
+        project_id: &str,
+        asbuilt_slug_override: Option<&str>,
     ) -> Result<SyncReport, StoreError> {
-        if req.acceptor_family.trim().is_empty() {
-            return Err(StoreError::InvalidInput(
-                "acceptor_family cannot be empty".to_string(),
-            ));
-        }
+        let project_id = validate_slug(project_id, "project_id")?;
+        let slug_override = match asbuilt_slug_override
+            .map(str::trim)
+            .filter(|val| !val.is_empty())
+        {
+            Some(raw_slug) => Some(validate_slug(raw_slug, "asbuilt_slug")?),
+            None => None,
+        };
 
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
@@ -794,11 +965,99 @@ impl StreamlineStore {
         if !grant.can_write {
             return Err(StoreError::ForbiddenWrite);
         }
-        check_shelf_access_tx(&tx, &grant, "projects", Some(&req.project_id))?;
-        let _ = load_project_tx(&tx, &req.project_id)?;
+        check_shelf_access_tx(&tx, &grant, "projects", Some(&project_id))?;
+
+        let bundle = load_project_bundle_tx(&tx, &project_id)?;
+        let plan_rev = bundle.project.plan_locked_rev.ok_or_else(|| {
+            StoreError::InvalidState(
+                "project plan must be locked before saving a sync report".to_string(),
+            )
+        })?;
+
+        let target_res = if let Some(ref slug_name) = slug_override {
+            bundle
+                .resources
+                .iter()
+                .find(|res| &res.slug == slug_name)
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "as_built resource '{slug_name}' not found in project '{project_id}'"
+                    ))
+                })?
+        } else {
+            bundle
+                .resources
+                .iter()
+                .find(|res| res.trio_role.as_deref() == Some("as_built"))
+                .or_else(|| {
+                    bundle
+                        .resources
+                        .iter()
+                        .find(|res| res.trio_role.as_deref() == Some("fix_record"))
+                })
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "no as_built or fix_record resource found in project '{project_id}'"
+                    ))
+                })?
+        };
+
+        let asbuilt_doc = read_resource_by_id_tx(&tx, &target_res.id)?;
+        let asbuilt_rev = asbuilt_doc.resource.current_rev;
+        let summary = check_sync(
+            &bundle.requirements,
+            &bundle.own_decisions,
+            &asbuilt_doc.body_md,
+        );
+        let paired_rows = summary.rows;
+        let verdict = if paired_rows.is_empty() {
+            SyncVerdict::Fail
+        } else if paired_rows.iter().all(|row| row.matched) {
+            SyncVerdict::Pass
+        } else if paired_rows.iter().any(|row| row.matched) {
+            SyncVerdict::Partial
+        } else {
+            SyncVerdict::Fail
+        };
+
+        let bound_family = grant
+            .model_family
+            .as_deref()
+            .map(str::trim)
+            .filter(|val| !val.is_empty())
+            .map(str::to_string);
+
+        let acceptor_family = if bundle.project.risk >= 2 {
+            let fam = match bound_family {
+                Some(family_name) => family_name,
+                None if grant.principal_role == PrincipalRole::Owner => {
+                    grant.principal_role.as_str().to_string()
+                }
+                None => {
+                    return Err(StoreError::InvalidState(
+                        "R2+ sync report requires grant bound to a trusted model_family"
+                            .to_string(),
+                    ));
+                }
+            };
+            for req_row in &bundle.requirements {
+                if let Some(ref bf) = req_row.builder_family {
+                    let trimmed_bf = bf.trim();
+                    if !trimmed_bf.is_empty() && trimmed_bf.eq_ignore_ascii_case(&fam) {
+                        return Err(StoreError::Core(CoreError::SameFamilyForbidden {
+                            builder_family: trimmed_bf.to_string(),
+                            acceptor_family: fam,
+                        }));
+                    }
+                }
+            }
+            fam
+        } else {
+            bound_family.unwrap_or_else(|| grant.principal_role.as_str().to_string())
+        };
 
         let report_id = format!("sync-{}", uuid::Uuid::new_v4());
-        let paired_json = serde_json::to_string(&req.paired_rows)?;
+        let paired_json = serde_json::to_string(&paired_rows)?;
         let now = now_rfc3339();
 
         tx.execute(
@@ -808,12 +1067,12 @@ impl StreamlineStore {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 report_id,
-                req.project_id,
-                req.plan_rev,
-                req.asbuilt_rev,
+                project_id,
+                plan_rev,
+                asbuilt_rev,
                 paired_json,
-                req.verdict.as_str(),
-                req.acceptor_family.trim(),
+                verdict.as_str(),
+                acceptor_family,
                 now,
             ],
         )?;
@@ -825,22 +1084,35 @@ impl StreamlineStore {
             &report_id,
             "ok",
             serde_json::json!({
-                "project_id": req.project_id,
-                "verdict": req.verdict.as_str(),
+                "project_id": project_id,
+                "plan_rev": plan_rev,
+                "asbuilt_rev": asbuilt_rev,
+                "verdict": verdict.as_str(),
+                "acceptor_family": acceptor_family,
             }),
         )?;
 
         tx.commit()?;
         Ok(SyncReport {
             report_id,
-            project_id: req.project_id,
-            plan_rev: req.plan_rev,
-            asbuilt_rev: req.asbuilt_rev,
-            paired_rows: req.paired_rows,
-            verdict: req.verdict,
-            acceptor_family: req.acceptor_family,
+            project_id,
+            plan_rev,
+            asbuilt_rev,
+            paired_rows,
+            verdict,
+            acceptor_family,
             created_at: now,
         })
+    }
+
+    /// Computes and saves a server-verified cross-model sync report for a Trio+ project,
+    /// ignoring any caller-supplied verdict, paired rows, revision numbers, or claimed family.
+    pub fn save_sync_report(
+        &self,
+        grant_id: &str,
+        req: SaveSyncReportRequest,
+    ) -> Result<SyncReport, StoreError> {
+        self.compute_and_save_sync_report(grant_id, &req.project_id, None)
     }
 
     /// Reads a sync report by `report_id`, or the latest sync report for `project_id`.
@@ -928,6 +1200,7 @@ impl StreamlineStore {
         let saved = save_resource_tx(
             &tx,
             &grant.principal_id,
+            Some(&grant),
             SaveResourceRequest {
                 shelf_slug: "projects".to_string(),
                 slug,

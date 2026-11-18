@@ -1,6 +1,6 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use chrono::{SecondsFormat, Utc};
@@ -11,7 +11,7 @@ use streamline_safe::{inspect_text, RedactionPolicy, ViolationKind};
 use crate::error::ConveyorError;
 use crate::staging::{
     compute_tree_manifest, freeze_readonly_tree, stage_readonly_inputs, unfreeze_readonly_dir,
-    verify_cleanup_clean,
+    verify_cleanup_clean, verify_no_symlink_components,
 };
 
 const SAFE_ENV_VARS: [&str; 4] = ["PATH", "HOME", "TMPDIR", "LANG"];
@@ -167,11 +167,10 @@ fn select_harnesses<'a>(
             Some(candidate)
         }
         None => {
-            let distinct = config.harnesses.iter().find(|h| {
-                !h.family
-                    .trim()
-                    .eq_ignore_ascii_case(builder.family.trim())
-            });
+            let distinct = config
+                .harnesses
+                .iter()
+                .find(|h| !h.family.trim().eq_ignore_ascii_case(builder.family.trim()));
             match distinct {
                 Some(candidate) => {
                     validate_harness_command(candidate, "acceptor")?;
@@ -199,16 +198,47 @@ fn validate_harness_command(harness: &HarnessSpec, role: &str) -> Result<(), Con
 }
 
 fn execute_conveyor_inner(ctx: &RunContext<'_>) -> Result<DispatchOutcome, ConveyorError> {
-    let staged_manifest = match stage_readonly_inputs(&ctx.req.input_paths, &ctx.stage_dir) {
+    let validated_inputs = match validate_input_paths_in_scope(ctx.config, &ctx.req.input_paths) {
+        Ok(paths) => paths,
+        Err(violation) => {
+            return match violation {
+                InputScopeViolation::SymlinkRejected(path_str) => record_input_rejection_impasse(
+                    ctx,
+                    "SYMLINK_INPUT_REJECTED",
+                    "Rejected path",
+                    &path_str,
+                    "Symbolic links are forbidden in staged inputs. No builder execution strike was counted.",
+                ),
+                InputScopeViolation::OutsideAllowedRoot(path_str) => record_input_rejection_impasse(
+                    ctx,
+                    "INPUT_OUTSIDE_ALLOWED_ROOT",
+                    "Rejected path",
+                    &path_str,
+                    "Declared input path is outside allowed input roots. No builder execution strike was counted.",
+                ),
+            };
+        }
+    };
+
+    let staged_manifest = match stage_readonly_inputs(&validated_inputs, &ctx.stage_dir) {
         Ok(manifest) => manifest,
         Err(ConveyorError::MissingInput(missing_path)) => {
-            return record_missing_input_impasse(ctx, &missing_path);
+            return record_input_rejection_impasse(
+                ctx,
+                "MISSING_INPUT",
+                "Missing path",
+                &missing_path,
+                "Declared input path was not found on disk. No builder execution strike was counted.",
+            );
         }
         Err(other) => return Err(other),
     };
 
     let build_env = [
-        ("STREAMLINE_PROJECT_ID", OsStr::new(ctx.req.project_id.as_str())),
+        (
+            "STREAMLINE_PROJECT_ID",
+            OsStr::new(ctx.req.project_id.as_str()),
+        ),
         ("STREAMLINE_PHASE", OsStr::new("build")),
         ("STREAMLINE_STAGE_DIR", ctx.stage_dir.as_os_str()),
         ("STREAMLINE_WORK_DIR", ctx.work_dir.as_os_str()),
@@ -349,19 +379,142 @@ fn execute_conveyor_inner(ctx: &RunContext<'_>) -> Result<DispatchOutcome, Conve
     run_acceptance_pass(ctx, build_run, acceptor, &policy)
 }
 
-fn record_missing_input_impasse(
+enum InputScopeViolation {
+    SymlinkRejected(String),
+    OutsideAllowedRoot(String),
+}
+
+fn validate_input_paths_in_scope(
+    config: &StreamlineConfig,
+    input_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, InputScopeViolation> {
+    if input_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let allowed_roots = config.effective_allowed_input_roots();
+    let canonical_roots: Vec<PathBuf> = allowed_roots
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect();
+    if canonical_roots.is_empty() {
+        return Err(InputScopeViolation::OutsideAllowedRoot(
+            input_paths[0].display().to_string(),
+        ));
+    }
+
+    let mut validated = Vec::with_capacity(input_paths.len());
+    for input_path in input_paths {
+        let display_path = input_path.display().to_string();
+        match fs::symlink_metadata(input_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(InputScopeViolation::SymlinkRejected(display_path));
+                }
+                if let Err(err) = verify_no_symlink_components(input_path) {
+                    match err {
+                        ConveyorError::MissingInput(_) => {
+                            validate_missing_path_scope(input_path, &canonical_roots)?;
+                            validated.push(input_path.clone());
+                            continue;
+                        }
+                        _ => return Err(InputScopeViolation::SymlinkRejected(display_path)),
+                    }
+                }
+                let canonical_input = fs::canonicalize(input_path)
+                    .map_err(|_| InputScopeViolation::OutsideAllowedRoot(display_path.clone()))?;
+                if !canonical_roots
+                    .iter()
+                    .any(|root| canonical_input.starts_with(root))
+                {
+                    return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+                }
+                validated.push(canonical_input);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                validate_missing_path_scope(input_path, &canonical_roots)?;
+                validated.push(input_path.clone());
+            }
+            Err(_) => {
+                return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+            }
+        }
+    }
+
+    Ok(validated)
+}
+
+fn validate_missing_path_scope(
+    input_path: &Path,
+    canonical_roots: &[PathBuf],
+) -> Result<(), InputScopeViolation> {
+    let display_path = input_path.display().to_string();
+    let abs_path = if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| InputScopeViolation::OutsideAllowedRoot(display_path.clone()))?
+            .join(input_path)
+    };
+
+    let mut existing = abs_path.as_path();
+    let mut tail_segments: Vec<OsString> = Vec::new();
+    while fs::symlink_metadata(existing).is_err() {
+        let mut comps = existing.components();
+        let Some(last) = comps.next_back() else {
+            return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+        };
+        match last {
+            Component::Normal(seg) => tail_segments.push(seg.to_os_string()),
+            Component::ParentDir => tail_segments.push(OsString::from("..")),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+            }
+        }
+        existing = comps.as_path();
+        if existing.as_os_str().is_empty() {
+            return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+        }
+    }
+
+    let mut resolved = fs::canonicalize(existing)
+        .map_err(|_| InputScopeViolation::OutsideAllowedRoot(display_path.clone()))?;
+    for seg in tail_segments.into_iter().rev() {
+        if seg == ".." {
+            if !resolved.pop() {
+                return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+            }
+        } else if seg != "." {
+            resolved.push(seg);
+        }
+    }
+
+    if !canonical_roots
+        .iter()
+        .any(|root| resolved.starts_with(root))
+    {
+        return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+    }
+    Ok(())
+}
+
+fn record_input_rejection_impasse(
     ctx: &RunContext<'_>,
-    missing_path: &str,
+    reason_code: &str,
+    path_label: &str,
+    rejected_path: &str,
+    detail: &str,
 ) -> Result<DispatchOutcome, ConveyorError> {
     let escalation = format!(
         "# Conveyor Escalation Report\n\n\
-         - Reason: `MISSING_INPUT`\n\
+         - Reason: `{reason_code}`\n\
          - Project ID: `{}`\n\
          - Run ID: `{}`\n\
          - Harness: `{}` (`{}`)\n\
-         - Missing path: `{}`\n\n\
-         Declared input path was not found on disk. No builder execution strike was counted.\n",
-        ctx.req.project_id, ctx.build_run_id, ctx.builder.id, ctx.builder.family, missing_path
+         - {path_label}: `{rejected_path}`\n\n\
+         {detail}\n",
+        ctx.req.project_id, ctx.build_run_id, ctx.builder.id, ctx.builder.family
     );
     fs::write(ctx.out_dir.join("ESCALATION.md"), escalation.as_bytes())
         .map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
@@ -454,7 +607,10 @@ fn run_acceptance_pass(
     let accept_run_id = format!("run-{}", uuid::Uuid::new_v4());
     let accept_started_at = utc_now_rfc3339();
     let accept_env = [
-        ("STREAMLINE_PROJECT_ID", OsStr::new(ctx.req.project_id.as_str())),
+        (
+            "STREAMLINE_PROJECT_ID",
+            OsStr::new(ctx.req.project_id.as_str()),
+        ),
         ("STREAMLINE_PHASE", OsStr::new("accept")),
         ("STREAMLINE_STAGE_DIR", ctx.stage_dir.as_os_str()),
         ("STREAMLINE_BUILD_OUT_DIR", ctx.out_dir.as_os_str()),
@@ -621,10 +777,7 @@ fn run_harness_command(
     }
 
     let output = cmd.output().map_err(|err| {
-        ConveyorError::RunnerFailure(format!(
-            "failed to spawn harness '{}': {err}",
-            harness.id
-        ))
+        ConveyorError::RunnerFailure(format!("failed to spawn harness '{}': {err}", harness.id))
     })?;
     Ok(output.status)
 }
@@ -679,7 +832,9 @@ fn collect_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Conve
             fs::symlink_metadata(&path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
         let ft = link_meta.file_type();
         if ft.is_symlink() {
-            continue;
+            return Err(ConveyorError::StageFailure(
+                "symlinks are forbidden in harness output directories".to_string(),
+            ));
         }
         if ft.is_dir() {
             collect_regular_files(&path, out)?;

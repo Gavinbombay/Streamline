@@ -344,6 +344,7 @@ impl StreamlineStore {
                 let saved = save_resource_tx(
                     &tx,
                     "legacy-import",
+                    None,
                     SaveResourceRequest {
                         shelf_slug: shelf_slug.to_string(),
                         slug: final_slug,

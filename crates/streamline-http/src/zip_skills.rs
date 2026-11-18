@@ -64,15 +64,50 @@ fn parse_frontmatter_description(markdown: &str) -> String {
     String::new()
 }
 
+fn read_verified_skill_markdown(
+    skills_dir: &Path,
+    canon_skills: &Path,
+    name: &str,
+) -> Option<String> {
+    let skill_subdir = skills_dir.join(name);
+    let subdir_meta = fs::symlink_metadata(&skill_subdir).ok()?;
+    if subdir_meta.file_type().is_symlink() || !subdir_meta.is_dir() {
+        return None;
+    }
+    let canon_subdir = fs::canonicalize(&skill_subdir).ok()?;
+    if !canon_subdir.starts_with(canon_skills) {
+        return None;
+    }
+
+    let skill_md_path = skill_subdir.join("SKILL.md");
+    let file_meta = fs::symlink_metadata(&skill_md_path).ok()?;
+    if file_meta.file_type().is_symlink() || !file_meta.is_file() {
+        return None;
+    }
+    let canon_file = fs::canonicalize(&skill_md_path).ok()?;
+    if !canon_file.starts_with(canon_skills) {
+        return None;
+    }
+
+    fs::read_to_string(&canon_file)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+}
+
 /// Loads all four portable Streamline skills from `skills_dir`, falling back to
-/// embedded compile-time copies so single-binary deployments always serve complete skills.
+/// embedded compile-time copies whenever a disk directory or file is missing,
+/// unreadable, or traverses a symlink.
 pub fn load_bundled_skills(skills_dir: &Path) -> Vec<BundledSkill> {
+    let canon_skills = fs::symlink_metadata(skills_dir)
+        .ok()
+        .filter(|meta| !meta.file_type().is_symlink() && meta.is_dir())
+        .and_then(|_| fs::canonicalize(skills_dir).ok());
+
     let mut skills = Vec::with_capacity(EMBEDDED_SKILLS.len());
     for (name, role, entry_path, embedded_body) in EMBEDDED_SKILLS {
-        let disk_path = skills_dir.join(name).join("SKILL.md");
-        let body_md = fs::read_to_string(&disk_path)
-            .ok()
-            .filter(|text| !text.trim().is_empty())
+        let body_md = canon_skills
+            .as_deref()
+            .and_then(|canon| read_verified_skill_markdown(skills_dir, canon, name))
             .unwrap_or_else(|| embedded_body.to_string());
         let description = parse_frontmatter_description(&body_md);
         let sha256 = sha256_hex(body_md.as_bytes());

@@ -18,7 +18,7 @@ Streamline stores durable rules, project plans, Source Passports, and reusable l
 
 Streamline grew out of running multiple AI assistants across real engineering projects and hitting the same failure modes over and over: agents skipping project rules, silently overwriting owner choices, marking unverified work live, or burying hard-won lessons inside old job folders. It puts a single compiled Rust server (`rust-version = "1.98"`) in front of your knowledge base and workflow state so rules are checked by code rather than politeness.
 
-**Early-release status (`v0.1`)**: Slice 1 is built and verified across the HTTP/MCP server, 38 tools, SQLite store, two-way vault sync, redaction gate, Trio+ plan locking, central `lessons_learned`, `DOC_PENDING_OWNER` closeout gate, and `streamline-conveyor` cross-family and cleanup guards. Automated subprocess/webhook worker dispatch in the conveyor runner is staged for Slice 2.
+**Early-release status (`v0.1.0`)**: Built and verified across the HTTP/MCP server, 42 tools, SQLite store, two-way vault sync, redaction gate, Trio+ plan locking, central `lessons_learned`, `DOC_PENDING_OWNER` closeout gate, interactive 3-pane Web UI, and `streamline-conveyor` hands-off worker dispatch, cross-family acceptance, cleanup quarantine, and JSONL trajectory export.
 
 ## Features
 
@@ -31,7 +31,7 @@ Streamline grew out of running multiple AI assistants across real engineering pr
 
 ## For AI agents
 
-Streamline exposes both a **Streamable HTTP MCP endpoint** (`POST /mcp`), a **stdio MCP loop** (`streamline mcp-stdio`), and a **typed REST tool API** (`POST /api/tools/:tool_name`) backed by the same 38-tool registry.
+Streamline exposes both a **Streamable HTTP MCP endpoint** (`POST /mcp`), a **stdio MCP loop** (`streamline mcp-stdio`), and a **typed REST tool API** (`POST /api/tools/:tool_name`) backed by the same 42-tool registry.
 
 - **Authentication**: Pass a grant credential via `Authorization: Bearer <CREDENTIAL>` or `X-Streamline-Credential: <CREDENTIAL>` (or `STREAMLINE_CREDENTIAL` in `mcp-stdio` mode). Only `GET /ready` and `ready` are unauthenticated.
 - **Mandatory rule handshake**: Call `bootstrap` first to read `current_rules_sha256` and your `granted_tags`, then call `ack_rules` with that exact digest. Any mutating tool called beforehand fails with HTTP `412` (`RULES_ACK_REQUIRED`).
@@ -43,7 +43,7 @@ Streamline exposes both a **Streamable HTTP MCP endpoint** (`POST /mcp`), a **st
 | Shelves & Passports | `list_shelves`, `list_resources`, `read_resource`, `search_resources`, `resource_history`, `compare_resources`, `get_source_passport`, `update_source_passport`, `set_lifecycle_tier` | Credential + shelf tag; writes require `ack_rules` | Browse active or dormant shelves, inspect diffs and freshness |
 | Profile & Skills | `get_workspace`, `list_skills`, `select_context` | Credential + tag check | Inspect caller permissions and select role context |
 | Trio+ Planning & Sync | `assess_trio_work`, `create_trio_project`, `list_trio_projects`, `get_project_bundle`, `save_resource`, `save_project_documents`, `restore_resource`, `lock_project_plan`, `upsert_own_decision`, `record_divergence`, `upsert_requirement_row`, `update_requirement_stage`, `check_sync`, `save_sync_report`, `get_sync_report` | Credential + `ack_rules` + role checks | Size `P0`..`P4`, lock `OWN` rows, log `DIV`s, trace `D I T A L` |
-| Closeout & Lessons | `mark_project_cleanup_verified`, `record_lesson`, `record_no_new_lessons`, `query_lessons`, `submit_how_it_works`, `approve_release`, `sync_vault`, `export_workspace` | `approve_release` requires `owner` role | Verify cleanup, save forward lessons, gate on `HOW-IT-WORKS` |
+| Closeout, Conveyor & Lessons | `dispatch_run`, `list_runs`, `get_run`, `export_trajectory`, `mark_project_cleanup_verified`, `record_lesson`, `record_no_new_lessons`, `query_lessons`, `submit_how_it_works`, `approve_release`, `sync_vault`, `export_workspace` | `dispatch_run` requires `can_dispatch`; `approve_release` requires `owner` | Run hands-off conveyor, verify cleanup, save forward lessons, gate on `HOW-IT-WORKS` |
 | Web UI & Bundles | `GET /`, `GET /downloads/streamline-skills.zip`, `POST /mcp`, `POST /api/tools/:tool_name` | UI open on local bind; tools enforce grant auth | 3-pane workspace, skill zip archive, MCP/REST dispatch |
 
 Example handshake over the REST tool endpoint:
@@ -66,7 +66,7 @@ streamline (src/main.rs: serve | mcp-stdio | init-grant | import-legacy | sync-v
   ├── crates/streamline-core     Domain models, P0..P4 Trio+ planner, OWN lock rules, D I T A L checks
   ├── crates/streamline-safe     Redaction engine, private-IP filter, dash guard, path sanitizer
   ├── crates/streamline-store    Single SQLite writer (rusqlite), append-only revisions, Obsidian vault sync
-  ├── crates/streamline-conveyor Read-only manifest hashing, stray-artifact cleanup checks, cross-family guard
+  ├── crates/streamline-conveyor Scoped read-only staging, 2-strike runner, cleanup quarantine, cross-family guard, JSONL trajectories
   └── crates/streamline-http     Axum router, Streamable HTTP + stdio MCP handler, REST tools, 3-pane Web UI
 ```
 
@@ -95,6 +95,7 @@ bind_admin = "127.0.0.1:5881"
 db_path = "./data/streamline.sqlite3"
 vault_sync_dir = "./data/vault"
 runs_dir = "./data/runs"
+allowed_input_roots = ["./data/vault", "./data/runs"]
 public_safe_mode = true
 ```
 
@@ -104,6 +105,7 @@ public_safe_mode = true
 export STREAMLINE_BOOTSTRAP_CRED="<CREDENTIAL>"
 cargo run --locked -- --config ./streamline.toml init-grant \
   --principal-id owner-1 --handle owner --role owner \
+  --model-family owner \
   --credential-env STREAMLINE_BOOTSTRAP_CRED \
   --tags standards,runbooks,architecture,projects,skills,inbox,archive \
   --write --dispatch

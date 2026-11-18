@@ -10,18 +10,79 @@ pub mod zip_skills;
 #[cfg(test)]
 mod tests;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use tower_http::services::ServeDir;
 
 pub use error::{ApiEnvelope, ApiError, ApiErrorBody};
 pub use mcp::handle_mcp_jsonrpc;
 pub use state::AppState;
 pub use tools::{tools_list, McpToolDescriptor, ReadyStatus};
+
+pub(crate) fn is_verified_real_dir(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| !meta.file_type().is_symlink() && meta.is_dir())
+        .unwrap_or(false)
+}
+
+fn plugin_content_type(asset_path: &std::path::Path) -> &'static str {
+    match asset_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "json" => "application/json; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+fn load_verified_plugin_asset(
+    plugin_dir: &std::path::Path,
+    asset_rel: &str,
+) -> Option<(&'static str, Vec<u8>)> {
+    if !is_verified_real_dir(plugin_dir) {
+        return None;
+    }
+    let canon_root = std::fs::canonicalize(plugin_dir).ok()?;
+    let trimmed = asset_rel.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains('\\') || trimmed.contains('\0') {
+        return None;
+    }
+    let mut candidate = plugin_dir.to_path_buf();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('.') {
+            return None;
+        }
+        candidate.push(segment);
+        let meta = std::fs::symlink_metadata(&candidate).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+    }
+    let final_meta = std::fs::symlink_metadata(&candidate).ok()?;
+    if final_meta.file_type().is_symlink()
+        || !final_meta.is_file()
+        || final_meta.len() > 4 * 1024 * 1024
+    {
+        return None;
+    }
+    let canon_file = std::fs::canonicalize(&candidate).ok()?;
+    if !canon_file.starts_with(&canon_root) {
+        return None;
+    }
+    let bytes = std::fs::read(&canon_file).ok()?;
+    Some((plugin_content_type(&canon_file), bytes))
+}
 
 /// Builds the complete Axum router for Streamline HTTP, MCP, skills archive, and Web UI.
 pub fn build_router(state: AppState) -> Router {
@@ -33,10 +94,52 @@ pub fn build_router(state: AppState) -> Router {
         .route("/downloads/streamline-skills.zip", get(skills_zip_handler));
 
     if let Some(plugin_dir) = state.config.presence_plugin_path() {
-        router = router.nest_service("/_streamline/presence-plugin", ServeDir::new(plugin_dir));
+        if is_verified_real_dir(plugin_dir) {
+            router = router.route(
+                "/_streamline/presence-plugin/*asset_path",
+                get(presence_plugin_handler),
+            );
+        } else {
+            tracing::warn!(
+                path = %plugin_dir.display(),
+                "ignoring presence_plugin_dir because it is missing, a symlink, or not a directory"
+            );
+        }
     }
 
-    router.with_state(state)
+    router
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .with_state(state)
+}
+
+async fn presence_plugin_handler(
+    State(state): State<AppState>,
+    Path(asset_path): Path<String>,
+) -> Response {
+    let Some(plugin_dir) = state
+        .config
+        .presence_plugin_path()
+        .map(std::path::Path::to_path_buf)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let loaded =
+        tokio::task::spawn_blocking(move || load_verified_plugin_asset(&plugin_dir, &asset_path))
+            .await
+            .ok()
+            .flatten();
+    match loaded {
+        Some((content_type, bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn ready_handler(State(state): State<AppState>) -> Response {
