@@ -610,12 +610,12 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
         },
         McpToolDescriptor {
             name: "sync_vault",
-            description: "Execute two-way Obsidian markdown sync on the configured vault_sync_dir.",
+            description: "Owner-only action: execute two-way Obsidian markdown sync on the configured vault_sync_dir.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         McpToolDescriptor {
             name: "export_workspace",
-            description: "Export a redacted, tag-scoped portable JSON archive of shelves, projects, and lessons.",
+            description: "Owner-only action: export a redacted, tag-scoped portable JSON archive of shelves, projects, and lessons.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -652,6 +652,15 @@ fn require_grant(grant: Option<&AccessGrant>) -> Result<&AccessGrant, ApiError> 
             "missing authenticated access grant",
         )
     })
+}
+
+fn require_owner(grant: &AccessGrant) -> Result<(), ApiError> {
+    if grant.principal_role != PrincipalRole::Owner {
+        return Err(ApiError::from(StoreError::ForbiddenRole(
+            grant.principal_role.to_string(),
+        )));
+    }
+    Ok(())
 }
 
 /// Executes a named Streamline tool after enforcing auth, redaction, and store rules.
@@ -1286,7 +1295,9 @@ pub fn dispatch_tool(
         }
         "sync_vault" => {
             let active_grant = require_grant(grant)?;
+            require_owner(active_grant)?;
             let checked = state.store.require_rules_acked(&active_grant.grant_id)?;
+            require_owner(&checked)?;
             if !checked.can_write {
                 return Err(ApiError::new(
                     StatusCode::FORBIDDEN,
@@ -1307,6 +1318,7 @@ pub fn dispatch_tool(
         }
         "export_workspace" => {
             let active_grant = require_grant(grant)?;
+            require_owner(active_grant)?;
             let args: ExportWorkspaceArgs = parse_args(raw_args)?;
             handle_export_workspace(state, active_grant, args.include_bodies.unwrap_or(true))
         }
@@ -1533,6 +1545,7 @@ fn handle_export_workspace(
     grant: &AccessGrant,
     include_bodies: bool,
 ) -> Result<Value, ApiError> {
+    require_owner(grant)?;
     let shelves = state.store.list_shelves(&grant.grant_id)?;
     let resources = state
         .store
@@ -1629,6 +1642,8 @@ fn handle_dispatch_run(
         preferred_builder_harness: args.preferred_builder_harness,
         preferred_acceptor_harness: args.preferred_acceptor_harness,
         risk_band,
+        caller_has_wildcard_scope: checked_grant.principal_role == PrincipalRole::Owner
+            || checked_grant.granted_tags.iter().any(|tag| tag == "*"),
     };
     let outcome: DispatchOutcome =
         execute_conveyor_blocking(&state.config, &req).map_err(map_conveyor_error)?;

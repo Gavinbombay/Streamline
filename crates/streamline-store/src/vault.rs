@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rusqlite::Connection;
 use streamline_core::{LifecycleTier, TriageState};
+use streamline_safe::PinnedDir;
 
 use crate::error::StoreError;
 use crate::grants::{now_rfc3339, record_audit_tx, sha256_hex};
@@ -217,114 +216,12 @@ fn build_conflict_markdown(
     )
 }
 
-fn verify_entry_inside_vault(path: &Path, canon_vault: &Path) -> Result<fs::Metadata, StoreError> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return Err(StoreError::InvalidInput(
-            "symlinks are forbidden inside vault_sync_dir".to_string(),
-        ));
+fn map_vault_io(err: std::io::Error) -> StoreError {
+    if err.kind() == std::io::ErrorKind::InvalidInput {
+        StoreError::InvalidInput(err.to_string())
+    } else {
+        StoreError::Io(err)
     }
-    let canon_path = fs::canonicalize(path)?;
-    if !canon_path.starts_with(canon_vault) {
-        return Err(StoreError::InvalidInput(
-            "path escapes vault_sync_dir".to_string(),
-        ));
-    }
-    Ok(meta)
-}
-
-fn ensure_verified_vault_subdir(dir: &Path, canon_vault: &Path) -> Result<(), StoreError> {
-    match fs::symlink_metadata(dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(StoreError::InvalidInput(
-                    "symlinks are forbidden inside vault_sync_dir".to_string(),
-                ));
-            }
-            if !meta.is_dir() {
-                return Err(StoreError::InvalidInput(format!(
-                    "expected directory inside vault_sync_dir at '{}'",
-                    dir.display()
-                )));
-            }
-            if !fs::canonicalize(dir)?.starts_with(canon_vault) {
-                return Err(StoreError::InvalidInput(
-                    "path escapes vault_sync_dir".to_string(),
-                ));
-            }
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir)?;
-            let meta = fs::symlink_metadata(dir)?;
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(StoreError::InvalidInput(
-                    "symlinks are forbidden inside vault_sync_dir".to_string(),
-                ));
-            }
-            if !fs::canonicalize(dir)?.starts_with(canon_vault) {
-                return Err(StoreError::InvalidInput(
-                    "path escapes vault_sync_dir".to_string(),
-                ));
-            }
-            Ok(())
-        }
-        Err(err) => Err(StoreError::Io(err)),
-    }
-}
-
-fn atomic_write_vault_file(
-    target_path: &Path,
-    canon_vault: &Path,
-    contents: &str,
-) -> Result<(), StoreError> {
-    let parent_dir = target_path.parent().ok_or_else(|| {
-        StoreError::InvalidInput("vault target path missing parent directory".to_string())
-    })?;
-    ensure_verified_vault_subdir(parent_dir, canon_vault)?;
-
-    match fs::symlink_metadata(target_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(StoreError::InvalidInput(
-                    "symlinks are forbidden inside vault_sync_dir".to_string(),
-                ));
-            }
-            if !meta.is_file() {
-                return Err(StoreError::InvalidInput(format!(
-                    "expected regular file inside vault_sync_dir at '{}'",
-                    target_path.display()
-                )));
-            }
-            if !fs::canonicalize(target_path)?.starts_with(canon_vault) {
-                return Err(StoreError::InvalidInput(
-                    "path escapes vault_sync_dir".to_string(),
-                ));
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(StoreError::Io(err)),
-    }
-
-    let tmp_path = parent_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    let mut tmp_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)?;
-    if let Err(err) = tmp_file
-        .write_all(contents.as_bytes())
-        .and_then(|()| tmp_file.sync_all())
-    {
-        drop(tmp_file);
-        let _ = fs::remove_file(&tmp_path);
-        return Err(StoreError::Io(err));
-    }
-    drop(tmp_file);
-    if let Err(err) = fs::rename(&tmp_path, target_path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(StoreError::Io(err));
-    }
-    Ok(())
 }
 
 impl StreamlineStore {
@@ -334,33 +231,10 @@ impl StreamlineStore {
     /// - Imports clean disk edits when `base_sha256` matches the current DB digest.
     /// - Preserves concurrent DB + disk edits by writing an explicit conflict record in `inbox`
     ///   without overwriting either copy.
-    /// - Refuses symlinks anywhere inside `vault_dir` and writes files atomically via `.tmp-*`.
+    /// - Refuses symlinks anywhere inside `vault_dir` via descriptor-pinned `PinnedDir`
+    ///   (`openat`/`O_NOFOLLOW`/`renameat`).
     pub fn sync_vault_dir(&self, vault_dir: &Path) -> Result<VaultSyncSummary, StoreError> {
-        match fs::symlink_metadata(vault_dir) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(StoreError::InvalidInput(
-                        "symlinks are forbidden inside vault_sync_dir".to_string(),
-                    ));
-                }
-                if !meta.is_dir() {
-                    return Err(StoreError::InvalidInput(
-                        "vault_sync_dir exists and is not a directory".to_string(),
-                    ));
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(vault_dir)?;
-                let meta = fs::symlink_metadata(vault_dir)?;
-                if meta.file_type().is_symlink() || !meta.is_dir() {
-                    return Err(StoreError::InvalidInput(
-                        "symlinks are forbidden inside vault_sync_dir".to_string(),
-                    ));
-                }
-            }
-            Err(err) => return Err(StoreError::Io(err)),
-        }
-        let canon_vault = fs::canonicalize(vault_dir)?;
+        let vault_fd = PinnedDir::open_or_create_dir(vault_dir).map_err(map_vault_io)?;
 
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
@@ -378,47 +252,30 @@ impl StreamlineStore {
         let mut pending_exports: BTreeMap<(String, String), ResourceWithPassport> = BTreeMap::new();
 
         for shelf_slug in &shelf_slugs {
-            let shelf_dir = vault_dir.join(shelf_slug);
-            match fs::symlink_metadata(&shelf_dir) {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        return Err(StoreError::InvalidInput(
-                            "symlinks are forbidden inside vault_sync_dir".to_string(),
-                        ));
-                    }
-                    if !meta.is_dir() {
-                        continue;
-                    }
-                    if !fs::canonicalize(&shelf_dir)?.starts_with(&canon_vault) {
-                        return Err(StoreError::InvalidInput(
-                            "path escapes vault_sync_dir".to_string(),
-                        ));
-                    }
-                }
+            let shelf_fd = match vault_fd.open_subdir(shelf_slug) {
+                Ok(dir) => dir,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(StoreError::Io(err)),
-            }
+                Err(err) => return Err(map_vault_io(err)),
+            };
 
-            let mut entries: Vec<PathBuf> = Vec::new();
-            for entry_res in fs::read_dir(&shelf_dir)? {
-                let entry = entry_res?;
-                let entry_path = entry.path();
-                let meta = verify_entry_inside_vault(&entry_path, &canon_vault)?;
-                if meta.is_file() && entry_path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    entries.push(entry_path);
-                }
-            }
-            entries.sort();
+            let mut entry_names = shelf_fd.list_entry_names().map_err(map_vault_io)?;
+            entry_names.sort();
 
-            for file_path in entries {
-                let Some(file_stem) = file_path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                if file_stem.starts_with('.') {
+            for entry_name in entry_names {
+                let is_reg = shelf_fd
+                    .is_regular_file_nofollow(&entry_name)
+                    .map_err(map_vault_io)?;
+                if !is_reg || entry_name.starts_with('.') || !entry_name.ends_with(".md") {
                     continue;
                 }
-                verify_entry_inside_vault(&file_path, &canon_vault)?;
-                let raw_disk = fs::read_to_string(&file_path)?;
+                let file_stem = entry_name.strip_suffix(".md").unwrap_or(&entry_name);
+                if file_stem.is_empty() || file_stem.starts_with('.') {
+                    continue;
+                }
+
+                let raw_disk = shelf_fd
+                    .read_to_string_nofollow(&entry_name)
+                    .map_err(map_vault_io)?;
                 let (fm, disk_body) = parse_vault_markdown(&raw_disk);
                 let Some(slug) = fm
                     .slug
@@ -455,7 +312,9 @@ impl StreamlineStore {
                         if !expected_fm_matches {
                             let rendered =
                                 format_vault_markdown(&db_item.resource, &db_item.body_md)?;
-                            atomic_write_vault_file(&file_path, &canon_vault, &rendered)?;
+                            shelf_fd
+                                .atomic_write_nofollow(&entry_name, rendered.as_bytes(), 0o644)
+                                .map_err(map_vault_io)?;
                         }
                         summary.unchanged += 1;
                     } else if fm.base_sha256.as_deref() == Some(db_sha.as_str()) {
@@ -480,11 +339,15 @@ impl StreamlineStore {
                             },
                         )?;
                         let rendered = format_vault_markdown(&saved.resource, &saved.body_md)?;
-                        atomic_write_vault_file(&file_path, &canon_vault, &rendered)?;
+                        shelf_fd
+                            .atomic_write_nofollow(&entry_name, rendered.as_bytes(), 0o644)
+                            .map_err(map_vault_io)?;
                         summary.imported += 1;
                     } else if fm.base_sha256.as_deref() == Some(disk_sha256.as_str()) {
                         let rendered = format_vault_markdown(&db_item.resource, &db_item.body_md)?;
-                        atomic_write_vault_file(&file_path, &canon_vault, &rendered)?;
+                        shelf_fd
+                            .atomic_write_nofollow(&entry_name, rendered.as_bytes(), 0o644)
+                            .map_err(map_vault_io)?;
                         summary.exported += 1;
                     } else {
                         let conflict_slug = format!(
@@ -580,7 +443,9 @@ impl StreamlineStore {
                         },
                     )?;
                     let rendered = format_vault_markdown(&saved.resource, &saved.body_md)?;
-                    atomic_write_vault_file(&file_path, &canon_vault, &rendered)?;
+                    shelf_fd
+                        .atomic_write_nofollow(&entry_name, rendered.as_bytes(), 0o644)
+                        .map_err(map_vault_io)?;
                     summary.imported += 1;
                 }
             }
@@ -592,66 +457,62 @@ impl StreamlineStore {
             }
             let safe_shelf = validate_slug(&item.resource.shelf_slug, "shelf_slug")?;
             let safe_slug = validate_slug(&item.resource.slug, "slug")?;
-            let shelf_dir = vault_dir.join(&safe_shelf);
-            ensure_verified_vault_subdir(&shelf_dir, &canon_vault)?;
-            let target_path = shelf_dir.join(format!("{safe_slug}.md"));
+            let target_shelf_fd = vault_fd
+                .open_or_create_subdir(&safe_shelf, 0o755)
+                .map_err(map_vault_io)?;
+            let target_name = format!("{safe_slug}.md");
             let rendered = format_vault_markdown(&item.resource, &item.body_md)?;
-            atomic_write_vault_file(&target_path, &canon_vault, &rendered)?;
+            target_shelf_fd
+                .atomic_write_nofollow(&target_name, rendered.as_bytes(), 0o644)
+                .map_err(map_vault_io)?;
             summary.exported += 1;
         }
 
-        let lessons_dir = vault_dir.join("lessons");
-        match fs::symlink_metadata(&lessons_dir) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(StoreError::InvalidInput(
-                        "symlinks are forbidden inside vault_sync_dir".to_string(),
-                    ));
+        let existing_lessons_fd = match vault_fd.open_subdir("lessons") {
+            Ok(dir) => {
+                for entry_name in dir.list_entry_names().map_err(map_vault_io)? {
+                    let _ = dir
+                        .is_regular_file_nofollow(&entry_name)
+                        .map_err(map_vault_io)?;
                 }
-                if meta.is_dir() {
-                    if !fs::canonicalize(&lessons_dir)?.starts_with(&canon_vault) {
-                        return Err(StoreError::InvalidInput(
-                            "path escapes vault_sync_dir".to_string(),
-                        ));
-                    }
-                    for entry_res in fs::read_dir(&lessons_dir)? {
-                        let entry = entry_res?;
-                        let _ = verify_entry_inside_vault(&entry.path(), &canon_vault)?;
-                    }
-                }
+                Some(dir)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(StoreError::Io(err)),
-        }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(map_vault_io(err)),
+        };
 
         let lessons = load_all_lessons_tx(&tx)?;
         if !lessons.is_empty() {
-            ensure_verified_vault_subdir(&lessons_dir, &canon_vault)?;
+            let lessons_fd = match existing_lessons_fd {
+                Some(dir) => dir,
+                None => vault_fd
+                    .open_or_create_subdir("lessons", 0o755)
+                    .map_err(map_vault_io)?,
+            };
             for lesson in lessons {
                 let safe_id = validate_slug(&lesson.lesson_id, "lesson_id")?;
-                let target_path = lessons_dir.join(format!("{safe_id}.md"));
+                let file_name = format!("{safe_id}.md");
                 let rendered = format_lesson_markdown(&lesson)?;
-                let existing_matches = match fs::symlink_metadata(&target_path) {
-                    Ok(meta) => {
-                        if meta.file_type().is_symlink() {
-                            return Err(StoreError::InvalidInput(
-                                "symlinks are forbidden inside vault_sync_dir".to_string(),
-                            ));
+                let existing_matches = match lessons_fd.is_regular_file_nofollow(&file_name) {
+                    Ok(true) => match lessons_fd.read_to_string_nofollow(&file_name) {
+                        Ok(existing_text) => existing_text == rendered,
+                        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+                            return Err(map_vault_io(err));
                         }
-                        if !fs::canonicalize(&target_path)?.starts_with(&canon_vault) {
-                            return Err(StoreError::InvalidInput(
-                                "path escapes vault_sync_dir".to_string(),
-                            ));
-                        }
-                        meta.is_file()
-                            && fs::read_to_string(&target_path).ok().as_deref()
-                                == Some(rendered.as_str())
+                        Err(_) => false,
+                    },
+                    Ok(false) => {
+                        return Err(StoreError::InvalidInput(format!(
+                            "expected regular file inside vault_sync_dir/lessons at '{file_name}'"
+                        )));
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(err) => return Err(StoreError::Io(err)),
+                    Err(err) => return Err(map_vault_io(err)),
                 };
                 if !existing_matches {
-                    atomic_write_vault_file(&target_path, &canon_vault, &rendered)?;
+                    lessons_fd
+                        .atomic_write_nofollow(&file_name, rendered.as_bytes(), 0o644)
+                        .map_err(map_vault_io)?;
                     summary.exported += 1;
                 }
             }

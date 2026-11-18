@@ -161,6 +161,7 @@ fn readonly_staging_blocks_rogue_builder_mutation() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute rogue builder run");
@@ -219,6 +220,7 @@ fn full_conveyor_build_cleanup_scan_and_cross_family_accept_reaches_doc_pending(
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute full conveyor");
@@ -284,6 +286,7 @@ fn dirty_work_dir_quarantines_run_before_acceptance() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute dirty build");
@@ -318,6 +321,7 @@ fn two_strike_builder_failure_records_impasse_and_escalation() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute failing builder");
@@ -444,6 +448,7 @@ fn missing_input_records_impasse_without_builder_strike() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("missing input returns Impasse");
@@ -481,6 +486,7 @@ fn redaction_hit_in_build_output_records_impasse_without_leaking() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute redaction hit run");
@@ -514,6 +520,7 @@ fn same_family_rejected_upfront_for_r2_plus() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
     let err = execute_conveyor_blocking(&cfg_two, &req).expect_err("expected SameFamilyForbidden");
     assert!(matches!(err, ConveyorError::SameFamilyForbidden(_)));
@@ -529,6 +536,7 @@ fn same_family_rejected_upfront_for_r2_plus() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
     let ok_r1 = execute_conveyor_blocking(&cfg_one, &req_r1).expect("R1 single harness succeeds");
     assert_eq!(ok_r1.final_state, RunState::DocPendingOwner);
@@ -554,6 +562,7 @@ fn scrubbed_environment_excludes_unrelated_parent_vars() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 0,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute scrubbed env check");
@@ -618,6 +627,7 @@ fn acceptor_nonzero_exit_records_impasse_and_escalation() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("execute acceptor failure run");
@@ -668,6 +678,7 @@ fn r2_preferred_same_family_acceptor_rejected_and_r1_allowed() {
         preferred_builder_harness: Some("codex-a".to_string()),
         preferred_acceptor_harness: Some("codex-b".to_string()),
         risk_band: 2,
+        caller_has_wildcard_scope: true,
     };
     let err = execute_conveyor_blocking(&cfg, &req_r2).expect_err("R2 same-family rejected");
     assert!(matches!(err, ConveyorError::SameFamilyForbidden(_)));
@@ -678,6 +689,7 @@ fn r2_preferred_same_family_acceptor_rejected_and_r1_allowed() {
         preferred_builder_harness: Some("codex-a".to_string()),
         preferred_acceptor_harness: Some("codex-b".to_string()),
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
     let ok = execute_conveyor_blocking(&cfg, &req_r1).expect("R1 same-family allowed");
     assert_eq!(ok.final_state, RunState::DocPendingOwner);
@@ -723,6 +735,7 @@ fn input_path_outside_allowed_roots_is_blocked_at_impasse() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("outside root returns Impasse");
@@ -781,6 +794,7 @@ fn symlink_input_path_is_rejected_without_copying() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
 
     let outcome = execute_conveyor_blocking(&cfg, &req).expect("symlink input returns Impasse");
@@ -807,6 +821,7 @@ fn symlink_input_path_is_rejected_without_copying() {
         preferred_builder_harness: None,
         preferred_acceptor_harness: None,
         risk_band: 1,
+        caller_has_wildcard_scope: true,
     };
     let bundle_outcome =
         execute_conveyor_blocking(&cfg, &req_bundle).expect("nested symlink returns Impasse");
@@ -865,4 +880,184 @@ fn trajectory_export_refuses_symlinked_target_and_runs_dir() {
         .expect_err("symlinked runs_dir must fail");
     assert!(matches!(err_runs_dir, ConveyorError::StageFailure(_)));
     assert!(!outside_runs.join("trajectories.jsonl").exists());
+}
+
+#[test]
+fn project_scoped_dispatch_restricts_inputs_to_project_subdir() {
+    let tmp = TempDirGuard::new("conveyor-project-scope");
+    let allowed_root = tmp.path.join("allowed_root");
+    let proj_a_dir = allowed_root.join("projects").join("proj-a");
+    let proj_b_dir = allowed_root.join("projects").join("proj-b");
+    let vault_dir = tmp.path.join("vault");
+    let runs_dir = tmp.path.join("runs");
+
+    fs::create_dir_all(&proj_a_dir).expect("create proj-a dir");
+    fs::create_dir_all(&proj_b_dir).expect("create proj-b dir");
+    fs::create_dir_all(&vault_dir).expect("create vault dir");
+    fs::create_dir_all(&runs_dir).expect("create runs dir");
+
+    let proj_a_spec = proj_a_dir.join("spec.md");
+    let proj_b_spec = proj_b_dir.join("spec.md");
+    let root_level_spec = allowed_root.join("shared.md");
+    fs::write(&proj_a_spec, "Project A specification\n").expect("write proj-a spec");
+    fs::write(&proj_b_spec, "Project B private payload\n").expect("write proj-b spec");
+    fs::write(&root_level_spec, "Top-level shared payload\n").expect("write shared.md");
+
+    let builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "set -eu
+         printf 'ran\\n' > \"$STREAMLINE_WORK_DIR/ran.flag\"
+         cat \"$STREAMLINE_STAGE_DIR/INPUTS/spec.md\" > \"$STREAMLINE_OUT_DIR/artifact.md\"",
+    );
+
+    let cfg = StreamlineConfig {
+        vault_sync_dir: vault_dir.to_string_lossy().into_owned(),
+        runs_dir: runs_dir.to_string_lossy().into_owned(),
+        allowed_input_roots: vec![allowed_root.to_string_lossy().into_owned()],
+        public_safe_mode: true,
+        harnesses: vec![builder],
+        ..StreamlineConfig::default()
+    };
+
+    let cross_project_req = DispatchRequest {
+        project_id: "proj-a".to_string(),
+        input_paths: vec![proj_b_spec],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+        caller_has_wildcard_scope: false,
+    };
+    let blocked_outcome = execute_conveyor_blocking(&cfg, &cross_project_req)
+        .expect("cross-project input returns Impasse");
+    assert_eq!(blocked_outcome.final_state, RunState::Impasse);
+    assert_eq!(blocked_outcome.build_run.state, RunState::Impasse);
+    assert!(blocked_outcome.accept_run.is_none());
+    let escalation = blocked_outcome
+        .escalation_markdown
+        .as_deref()
+        .expect("escalation markdown present");
+    assert!(escalation.contains("INPUT_OUTSIDE_ALLOWED_ROOT"));
+
+    let blocked_run_dir = runs_dir.join(&blocked_outcome.build_run.run_id);
+    assert!(!blocked_run_dir.join("stage").join("INPUTS").exists());
+    assert!(!blocked_run_dir.join("work").join("ran.flag").exists());
+
+    let root_level_req = DispatchRequest {
+        project_id: "proj-a".to_string(),
+        input_paths: vec![root_level_spec],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+        caller_has_wildcard_scope: false,
+    };
+    let root_level_outcome = execute_conveyor_blocking(&cfg, &root_level_req)
+        .expect("root-level input outside project subdir returns Impasse");
+    assert_eq!(root_level_outcome.final_state, RunState::Impasse);
+    assert!(root_level_outcome
+        .escalation_markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("INPUT_OUTSIDE_ALLOWED_ROOT"));
+    assert!(!runs_dir
+        .join(&root_level_outcome.build_run.run_id)
+        .join("stage")
+        .join("INPUTS")
+        .exists());
+
+    let traversal_req = DispatchRequest {
+        project_id: "../proj-b".to_string(),
+        input_paths: vec![proj_a_spec.clone()],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+        caller_has_wildcard_scope: false,
+    };
+    let traversal_err = execute_conveyor_blocking(&cfg, &traversal_req)
+        .expect_err("project_id with traversal must be rejected");
+    assert!(matches!(traversal_err, ConveyorError::InvalidConfig(_)));
+
+    let allowed_req = DispatchRequest {
+        project_id: "proj-a".to_string(),
+        input_paths: vec![proj_a_spec],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 1,
+        caller_has_wildcard_scope: false,
+    };
+    let ok_outcome =
+        execute_conveyor_blocking(&cfg, &allowed_req).expect("own project input succeeds");
+    assert_eq!(ok_outcome.final_state, RunState::DocPendingOwner);
+    assert!(ok_outcome.escalation_markdown.is_none());
+    let artifact_path = runs_dir
+        .join(&ok_outcome.build_run.run_id)
+        .join("out")
+        .join("artifact.md");
+    assert_eq!(
+        fs::read_to_string(artifact_path).expect("read artifact.md"),
+        "Project A specification\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn intermediate_symlink_under_allowed_root_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDirGuard::new("conveyor-intermediate-symlink");
+    let allowed_dir = tmp.path.join("allowed_inputs");
+    let real_sub = allowed_dir.join("real_sub");
+    let outside_dir = tmp.path.join("outside_inputs");
+    let vault_dir = tmp.path.join("vault");
+    let runs_dir = tmp.path.join("runs");
+
+    fs::create_dir_all(&real_sub).expect("create real_sub");
+    fs::create_dir_all(&outside_dir).expect("create outside_dir");
+    fs::create_dir_all(&vault_dir).expect("create vault_dir");
+    fs::create_dir_all(&runs_dir).expect("create runs_dir");
+
+    fs::write(real_sub.join("inside.txt"), "INSIDE_DATA\n").expect("write inside.txt");
+    fs::write(outside_dir.join("outside.txt"), "OUTSIDE_DATA\n").expect("write outside.txt");
+
+    symlink(&real_sub, allowed_dir.join("internal_link")).expect("create internal symlink");
+    symlink(&outside_dir, allowed_dir.join("escape_link")).expect("create escape symlink");
+
+    let builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "printf 'ran\\n' > \"$STREAMLINE_WORK_DIR/ran.flag\"",
+    );
+    let cfg = StreamlineConfig {
+        vault_sync_dir: vault_dir.to_string_lossy().into_owned(),
+        runs_dir: runs_dir.to_string_lossy().into_owned(),
+        allowed_input_roots: vec![allowed_dir.to_string_lossy().into_owned()],
+        public_safe_mode: true,
+        harnesses: vec![builder],
+        ..StreamlineConfig::default()
+    };
+
+    for bad_input in [
+        allowed_dir.join("internal_link").join("inside.txt"),
+        allowed_dir.join("escape_link").join("outside.txt"),
+    ] {
+        let req = DispatchRequest {
+            project_id: "proj-inter-sym".to_string(),
+            input_paths: vec![bad_input],
+            preferred_builder_harness: None,
+            preferred_acceptor_harness: None,
+            risk_band: 1,
+            caller_has_wildcard_scope: true,
+        };
+        let outcome =
+            execute_conveyor_blocking(&cfg, &req).expect("intermediate symlink returns Impasse");
+        assert_eq!(outcome.final_state, RunState::Impasse);
+        assert!(outcome
+            .escalation_markdown
+            .as_deref()
+            .unwrap_or_default()
+            .contains("SYMLINK_INPUT_REJECTED"));
+        let run_dir = runs_dir.join(&outcome.build_run.run_id);
+        assert!(!run_dir.join("stage").join("INPUTS").exists());
+        assert!(!run_dir.join("work").join("ran.flag").exists());
+    }
 }

@@ -781,7 +781,7 @@ impl StreamlineStore {
         let how_it_works_approved =
             project.state == RunState::Done && project.how_it_works_resource_id.is_some();
 
-        let bound_family = grant
+        let effective_family: Option<String> = grant
             .model_family
             .as_deref()
             .map(str::trim)
@@ -791,50 +791,26 @@ impl StreamlineStore {
             .actor_family
             .as_deref()
             .map(str::trim)
-            .filter(|val| !val.is_empty())
-            .map(str::to_string);
+            .filter(|val| !val.is_empty());
 
-        let effective_family: Option<String> = if grant.principal_role == PrincipalRole::Owner {
-            match (&bound_family, &claimed_family) {
-                (Some(bound), Some(claimed)) if !bound.eq_ignore_ascii_case(claimed) => {
-                    return Err(StoreError::ForbiddenRole(
-                        "caller cannot spoof model_family; grant is bound to a different family"
-                            .to_string(),
-                    ));
-                }
-                (Some(bound), _) => Some(bound.clone()),
-                (None, claimed) => claimed.clone(),
+        if let Some(claimed) = claimed_family {
+            let matches_bound = effective_family
+                .as_deref()
+                .map(|bound| bound.eq_ignore_ascii_case(claimed))
+                .unwrap_or(false);
+            if !matches_bound {
+                return Err(StoreError::ForbiddenRole(
+                    "caller cannot spoof model_family; grant is not bound to claimed family"
+                        .to_string(),
+                ));
             }
-        } else {
-            if let Some(ref claimed) = claimed_family {
-                let matches_bound = bound_family
-                    .as_deref()
-                    .map(|bound| bound.eq_ignore_ascii_case(claimed))
-                    .unwrap_or(false);
-                if !matches_bound {
-                    return Err(StoreError::ForbiddenRole(
-                        "caller cannot spoof model_family; grant is bound to a different family"
-                            .to_string(),
-                    ));
-                }
-            }
-            bound_family.clone()
-        };
+        }
 
         if project.risk >= 2
-            && matches!(req.target_stage, ReqStage::I | ReqStage::T)
+            && matches!(req.target_stage, ReqStage::I | ReqStage::T | ReqStage::A)
             && effective_family.is_none()
         {
-            return Err(StoreError::InvalidState(
-                "R2+ work requires grant bound to a trusted model_family".to_string(),
-            ));
-        }
-        if project.risk >= 2
-            && req.target_stage == ReqStage::A
-            && grant.principal_role != PrincipalRole::Owner
-            && bound_family.is_none()
-        {
-            return Err(StoreError::InvalidState(
+            return Err(StoreError::ForbiddenRole(
                 "R2+ work requires grant bound to a trusted model_family".to_string(),
             ));
         }
@@ -1010,17 +986,9 @@ impl StreamlineStore {
             &asbuilt_doc.body_md,
         );
         let paired_rows = summary.rows;
-        let verdict = if paired_rows.is_empty() {
-            SyncVerdict::Fail
-        } else if paired_rows.iter().all(|row| row.matched) {
-            SyncVerdict::Pass
-        } else if paired_rows.iter().any(|row| row.matched) {
-            SyncVerdict::Partial
-        } else {
-            SyncVerdict::Fail
-        };
+        let verdict = summary.verdict;
 
-        let bound_family = grant
+        let effective_family = grant
             .model_family
             .as_deref()
             .map(str::trim)
@@ -1028,18 +996,11 @@ impl StreamlineStore {
             .map(str::to_string);
 
         let acceptor_family = if bundle.project.risk >= 2 {
-            let fam = match bound_family {
-                Some(family_name) => family_name,
-                None if grant.principal_role == PrincipalRole::Owner => {
-                    grant.principal_role.as_str().to_string()
-                }
-                None => {
-                    return Err(StoreError::InvalidState(
-                        "R2+ sync report requires grant bound to a trusted model_family"
-                            .to_string(),
-                    ));
-                }
-            };
+            let fam = effective_family.ok_or_else(|| {
+                StoreError::ForbiddenRole(
+                    "R2+ sync report requires grant bound to a trusted model_family".to_string(),
+                )
+            })?;
             for req_row in &bundle.requirements {
                 if let Some(ref bf) = req_row.builder_family {
                     let trimmed_bf = bf.trim();
@@ -1053,7 +1014,7 @@ impl StreamlineStore {
             }
             fam
         } else {
-            bound_family.unwrap_or_else(|| grant.principal_role.as_str().to_string())
+            effective_family.unwrap_or_else(|| grant.principal_role.as_str().to_string())
         };
 
         let report_id = format!("sync-{}", uuid::Uuid::new_v4());

@@ -3,6 +3,10 @@
 //! All verdicts are pure and deterministic, and violation reports never expose
 //! matched sensitive substrings.
 
+pub mod pinned_fs;
+
+pub use pinned_fs::PinnedDir;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

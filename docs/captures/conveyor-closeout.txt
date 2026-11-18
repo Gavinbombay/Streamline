@@ -1,10 +1,12 @@
-running 15 tests
+running 17 tests
 test tests::acceptor_nonzero_exit_records_impasse_and_escalation ... ok
 test tests::dirty_work_dir_quarantines_run_before_acceptance ... ok
 test tests::enforces_cross_family_on_r2_and_above ... ok
 test tests::full_conveyor_build_cleanup_scan_and_cross_family_accept_reaches_doc_pending ... ok
 test tests::input_path_outside_allowed_roots_is_blocked_at_impasse ... ok
+test tests::intermediate_symlink_under_allowed_root_is_rejected ... ok
 test tests::missing_input_records_impasse_without_builder_strike ... ok
+test tests::project_scoped_dispatch_restricts_inputs_to_project_subdir ... ok
 test tests::r2_preferred_same_family_acceptor_rejected_and_r1_allowed ... ok
 test tests::readonly_staging_blocks_rogue_builder_mutation ... ok
 test tests::redaction_hit_in_build_output_records_impasse_without_leaking ... ok
@@ -14,6 +16,6 @@ test tests::symlink_input_path_is_rejected_without_copying ... ok
 test tests::trajectory_export_refuses_symlinked_target_and_runs_dir ... ok
 test tests::trajectory_export_writes_verified_jsonl_and_blocks_unsafe_text ... ok
 test tests::two_strike_builder_failure_records_impasse_and_escalation ... ok
-test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
 running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1327,7 +1327,50 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
 
 #[tokio::test]
 async fn http_and_mcp_security_regressions_enforced() {
-    let state = make_test_state(StreamlineConfig::default());
+    let temp = TempDirGuard::new("streamline-http-sec-regressions");
+    let runs_dir = temp.path.join("runs");
+    let vault_dir = temp.path.join("vault");
+    let allowed_root = temp.path.join("allowed");
+    let other_proj_dir = allowed_root.join("projects").join("other-proj");
+    let sec_proj_dir = allowed_root.join("projects").join("sec-proj");
+    fs::create_dir_all(&runs_dir).expect("create runs dir");
+    fs::create_dir_all(&vault_dir).expect("create vault dir");
+    fs::create_dir_all(&other_proj_dir).expect("create other-proj dir");
+    fs::create_dir_all(&sec_proj_dir).expect("create sec-proj dir");
+    let other_proj_doc = other_proj_dir.join("doc.md");
+    fs::write(&other_proj_doc, "# Other Project\n").expect("write other-proj doc");
+    let sec_proj_doc = sec_proj_dir.join("doc.md");
+    fs::write(&sec_proj_doc, "# Sec Project\n").expect("write sec-proj doc");
+
+    let cfg = StreamlineConfig {
+        runs_dir: runs_dir.display().to_string(),
+        vault_sync_dir: vault_dir.display().to_string(),
+        allowed_input_roots: vec![allowed_root.display().to_string()],
+        harnesses: vec![
+            HarnessSpec {
+                id: "codex-sh".to_string(),
+                family: "openai-codex".to_string(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'builder-ok\\n'".to_string(),
+                ],
+                max_concurrency: 1,
+            },
+            HarnessSpec {
+                id: "gemini-sh".to_string(),
+                family: "google-gemini".to_string(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'acceptor-ok\\n'".to_string(),
+                ],
+                max_concurrency: 1,
+            },
+        ],
+        ..StreamlineConfig::default()
+    };
+    let state = make_test_state(cfg);
     let rules_sha = state.store.current_rules_sha256().expect("rules sha");
 
     let owner_cred = "cred-sec-owner";
@@ -1335,6 +1378,7 @@ async fn http_and_mcp_security_regressions_enforced() {
     let codex_worker_cred = "cred-sec-codex-w";
     let codex_spoof_cred = "cred-sec-codex-s";
     let gemini_acceptor_cred = "cred-sec-gemini-a";
+    let scoped_dispatch_cred = "cred-sec-scoped-dispatch";
 
     let owner_grant = seed_grant(
         &state.store,
@@ -1374,6 +1418,14 @@ async fn http_and_mcp_security_regressions_enforced() {
         vec!["*".to_string()],
         Some("google-gemini"),
     );
+    let scoped_dispatch_grant = seed_grant_with_family(
+        &state.store,
+        "sec-scoped-dispatch",
+        PrincipalRole::Agent,
+        scoped_dispatch_cred,
+        vec!["projects".to_string(), "project:sec-proj".to_string()],
+        Some("openai-codex"),
+    );
 
     for gid in [
         &owner_grant,
@@ -1381,6 +1433,7 @@ async fn http_and_mcp_security_regressions_enforced() {
         &codex_worker_grant,
         &codex_spoof_grant,
         &gemini_acceptor_grant,
+        &scoped_dispatch_grant,
     ] {
         state.store.ack_rules(gid, &rules_sha).unwrap();
     }
@@ -1534,6 +1587,43 @@ async fn http_and_mcp_security_regressions_enforced() {
     .await;
     assert!(parse_mcp_tool_text(&spoof_a).0);
 
+    // Unbound Owner grant (model_family: None) must be rejected on R2 stage A transition.
+    let owner_unbound_spoof_a = mcp_call(
+        &app,
+        Some(owner_cred),
+        212,
+        "update_requirement_stage",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "target_stage": "A",
+            "evidence_ref": "unbound owner spoof",
+            "actor_family": "google-gemini"
+        }),
+    )
+    .await;
+    let (owner_unbound_err, owner_unbound_data) = parse_mcp_tool_text(&owner_unbound_spoof_a);
+    assert!(owner_unbound_err);
+    assert_eq!(owner_unbound_data["error"]["code"], "FORBIDDEN");
+
+    let owner_unbound_none_a = mcp_call(
+        &app,
+        Some(owner_cred),
+        213,
+        "update_requirement_stage",
+        json!({
+            "project_id": "sec-proj",
+            "req_id": "REQ-01",
+            "target_stage": "A",
+            "evidence_ref": "unbound owner none"
+        }),
+    )
+    .await;
+    let (owner_unbound_none_err, owner_unbound_none_data) =
+        parse_mcp_tool_text(&owner_unbound_none_a);
+    assert!(owner_unbound_none_err);
+    assert_eq!(owner_unbound_none_data["error"]["code"], "FORBIDDEN");
+
     let real_a = mcp_call(
         &app,
         Some(gemini_acceptor_cred),
@@ -1615,6 +1705,42 @@ async fn http_and_mcp_security_regressions_enforced() {
     assert_eq!(real_sync_data["data"]["asbuilt_rev"], 2);
     assert_eq!(real_sync_data["data"]["paired_rows"][0]["matched"], true);
 
+    // Unmapped REQ-99 claim alongside matched REQ-01 must yield Partial verdict.
+    let save_asbuilt_unmapped = mcp_call(
+        &app,
+        Some(codex_worker_cred),
+        214,
+        "save_resource",
+        json!({
+            "shelf_slug": "projects",
+            "slug": "sec-proj-as_built",
+            "title": "Security Regression Demo: as_built",
+            "body_md": "# As Built\n\n| REQ-01 | A | Bound 127.0.0.1:5880 | test:ok |\n| REQ-99 | A | Extra unmapped claim | test:extra |\n",
+            "project_id": "sec-proj",
+            "trio_role": "as_built",
+            "summary": "Add unmapped REQ-99 row",
+            "expected_rev": 2
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&save_asbuilt_unmapped).0);
+
+    let partial_sync = mcp_call(
+        &app,
+        Some(gemini_acceptor_cred),
+        215,
+        "save_sync_report",
+        json!({ "project_id": "sec-proj" }),
+    )
+    .await;
+    let (partial_sync_err, partial_sync_data) = parse_mcp_tool_text(&partial_sync);
+    assert!(
+        !partial_sync_err,
+        "partial save_sync_report failed: {partial_sync_data}"
+    );
+    assert_eq!(partial_sync_data["data"]["verdict"], "partial");
+    assert_eq!(partial_sync_data["data"]["asbuilt_rev"], 3);
+
     // 5. Updating requirement statement via upsert_requirement_row resets stage A -> D.
     let reset_req = mcp_call(
         &app,
@@ -1634,6 +1760,81 @@ async fn http_and_mcp_security_regressions_enforced() {
     assert_eq!(reset_data["data"]["stage"], "D");
     assert!(reset_data["data"]["acceptor_family"].is_null());
     assert!(reset_data["data"]["builder_family"].is_null());
+
+    // 6. Write-enabled Agent grant receives 403 FORBIDDEN on sync_vault and export_workspace.
+    let agent_sync_vault_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/sync_vault")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {codex_worker_cred}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    let (agent_sync_status, agent_sync_body) =
+        read_json_body(app.clone().oneshot(agent_sync_vault_req).await.unwrap()).await;
+    assert_eq!(agent_sync_status, StatusCode::FORBIDDEN);
+    assert_eq!(agent_sync_body["error"]["code"], "FORBIDDEN");
+
+    let agent_export_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/export_workspace")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {codex_worker_cred}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    let (agent_export_status, agent_export_body) =
+        read_json_body(app.clone().oneshot(agent_export_req).await.unwrap()).await;
+    assert_eq!(agent_export_status, StatusCode::FORBIDDEN);
+    assert_eq!(agent_export_body["error"]["code"], "FORBIDDEN");
+
+    let owner_sync_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/sync_vault")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {owner_cred}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    let (owner_sync_status, _) =
+        read_json_body(app.clone().oneshot(owner_sync_req).await.unwrap()).await;
+    assert_eq!(owner_sync_status, StatusCode::OK);
+
+    let owner_export_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/export_workspace")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {owner_cred}"))
+        .body(Body::from("{}"))
+        .unwrap();
+    let (owner_export_status, _) =
+        read_json_body(app.clone().oneshot(owner_export_req).await.unwrap()).await;
+    assert_eq!(owner_export_status, StatusCode::OK);
+
+    // 7. Project-scoped can_dispatch Agent cannot dispatch inputs outside <allowed_root>/projects/<project_id>.
+    let scoped_dispatch_resp = mcp_call(
+        &app,
+        Some(scoped_dispatch_cred),
+        216,
+        "dispatch_run",
+        json!({
+            "project_id": "sec-proj",
+            "input_paths": [other_proj_doc.display().to_string()],
+            "preferred_builder_harness": "codex-sh"
+        }),
+    )
+    .await;
+    let (scoped_dispatch_err, scoped_dispatch_data) = parse_mcp_tool_text(&scoped_dispatch_resp);
+    assert!(
+        !scoped_dispatch_err,
+        "scoped dispatch should return Impasse outcome: {scoped_dispatch_data}"
+    );
+    assert_eq!(scoped_dispatch_data["data"]["final_state"], "IMPASSE");
+    assert_eq!(
+        scoped_dispatch_data["data"]["build_run"]["state"],
+        "IMPASSE"
+    );
+    assert!(scoped_dispatch_data["data"]["escalation_markdown"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("INPUT_OUTSIDE_ALLOWED_ROOT"));
 }
 
 #[cfg(unix)]
@@ -1643,18 +1844,29 @@ async fn skills_zip_and_presence_plugin_reject_symlinks_and_body_cap_enforced() 
     let outside_file = temp.path.join("outside.txt");
     fs::write(&outside_file, "OUTSIDE_SENTINEL_CONTENT\n").expect("write outside");
 
-    // 1. Symlinked skill file must be ignored and replaced by embedded fallback.
+    // 1. Symlinked and on-disk skill files must be ignored; skills serve strictly from embedded data.
     let skills_root = temp.path.join("skills");
     let dir_skill = skills_root.join("streamline-director");
+    let worker_skill_dir = skills_root.join("streamline-worker");
     fs::create_dir_all(&dir_skill).expect("create director skill dir");
+    fs::create_dir_all(&worker_skill_dir).expect("create worker skill dir");
     std::os::unix::fs::symlink(&outside_file, dir_skill.join("SKILL.md"))
         .expect("plant skill symlink");
+    fs::write(
+        worker_skill_dir.join("SKILL.md"),
+        "DISK_OVERRIDE_SENTINEL\n",
+    )
+    .expect("write worker disk override");
 
     let zip_bytes = crate::zip_skills::build_skills_zip(&skills_root);
     let zip_text = String::from_utf8_lossy(&zip_bytes);
     assert!(
         !zip_text.contains("OUTSIDE_SENTINEL_CONTENT"),
         "build_skills_zip must never read outside symlink target"
+    );
+    assert!(
+        !zip_text.contains("DISK_OVERRIDE_SENTINEL"),
+        "build_skills_zip must ignore disk overrides and serve embedded skills only"
     );
     assert!(zip_text.contains("streamline-director/SKILL.md"));
 

@@ -1,17 +1,19 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use streamline_core::{ConveyorRun, HarnessSpec, RunPhase, RunState, StreamlineConfig};
-use streamline_safe::{inspect_text, RedactionPolicy, ViolationKind};
+use streamline_safe::{inspect_text, PinnedDir, RedactionPolicy, ViolationKind};
 
 use crate::error::ConveyorError;
 use crate::staging::{
-    compute_tree_manifest, freeze_readonly_tree, stage_readonly_inputs, unfreeze_readonly_dir,
-    verify_cleanup_clean, verify_no_symlink_components,
+    compute_tree_manifest, freeze_readonly_tree, stage_pinned_inputs,
+    trim_trailing_slashes_and_dot, unfreeze_readonly_dir, verify_cleanup_clean,
+    verify_no_symlink_components, PinnedInputEntry,
 };
 
 const SAFE_ENV_VARS: [&str; 4] = ["PATH", "HOME", "TMPDIR", "LANG"];
@@ -24,6 +26,12 @@ pub struct DispatchRequest {
     pub preferred_builder_harness: Option<String>,
     pub preferred_acceptor_harness: Option<String>,
     pub risk_band: u8,
+    #[serde(default = "default_wildcard_scope")]
+    pub caller_has_wildcard_scope: bool,
+}
+
+fn default_wildcard_scope() -> bool {
+    true
 }
 
 /// Complete outcome of a blocking conveyor execution including build and optional
@@ -84,6 +92,9 @@ pub fn execute_conveyor_blocking(
         return Err(ConveyorError::InvalidConfig(
             "project_id must not be empty".to_string(),
         ));
+    }
+    if !req.caller_has_wildcard_scope {
+        validate_scoped_project_id(&req.project_id)?;
     }
     let runs_root = config.runs_dir.trim();
     if runs_root.is_empty() {
@@ -198,29 +209,37 @@ fn validate_harness_command(harness: &HarnessSpec, role: &str) -> Result<(), Con
 }
 
 fn execute_conveyor_inner(ctx: &RunContext<'_>) -> Result<DispatchOutcome, ConveyorError> {
-    let validated_inputs = match validate_input_paths_in_scope(ctx.config, &ctx.req.input_paths) {
-        Ok(paths) => paths,
+    let pinned_entries = match validate_and_pin_inputs(ctx.config, ctx.req) {
+        Ok(entries) => entries,
         Err(violation) => {
             return match violation {
-                InputScopeViolation::SymlinkRejected(path_str) => record_input_rejection_impasse(
+                InputPinError::InvalidConfig(msg) => Err(ConveyorError::InvalidConfig(msg)),
+                InputPinError::SymlinkRejected(path_str) => record_input_rejection_impasse(
                     ctx,
                     "SYMLINK_INPUT_REJECTED",
                     "Rejected path",
                     &path_str,
                     "Symbolic links are forbidden in staged inputs. No builder execution strike was counted.",
                 ),
-                InputScopeViolation::OutsideAllowedRoot(path_str) => record_input_rejection_impasse(
+                InputPinError::OutsideAllowedRoot(path_str) => record_input_rejection_impasse(
                     ctx,
                     "INPUT_OUTSIDE_ALLOWED_ROOT",
                     "Rejected path",
                     &path_str,
                     "Declared input path is outside allowed input roots. No builder execution strike was counted.",
                 ),
+                InputPinError::MissingInput(path_str) => record_input_rejection_impasse(
+                    ctx,
+                    "MISSING_INPUT",
+                    "Missing path",
+                    &path_str,
+                    "Declared input path was not found on disk. No builder execution strike was counted.",
+                ),
             };
         }
     };
 
-    let staged_manifest = match stage_readonly_inputs(&validated_inputs, &ctx.stage_dir) {
+    let staged_manifest = match stage_pinned_inputs(&pinned_entries, &ctx.stage_dir) {
         Ok(manifest) => manifest,
         Err(ConveyorError::MissingInput(missing_path)) => {
             return record_input_rejection_impasse(
@@ -379,122 +398,513 @@ fn execute_conveyor_inner(ctx: &RunContext<'_>) -> Result<DispatchOutcome, Conve
     run_acceptance_pass(ctx, build_run, acceptor, &policy)
 }
 
-enum InputScopeViolation {
+enum InputPinError {
+    InvalidConfig(String),
     SymlinkRejected(String),
     OutsideAllowedRoot(String),
+    MissingInput(String),
 }
 
-fn validate_input_paths_in_scope(
+struct PinnedRoot {
+    abs_raw_root: PathBuf,
+    canon_root: PathBuf,
+    dir: PinnedDir,
+}
+
+struct SymlinkedRoot {
+    abs_raw_root: PathBuf,
+    canon_root: Option<PathBuf>,
+}
+
+fn validate_scoped_project_id(project_id: &str) -> Result<(), ConveyorError> {
+    if project_id.is_empty()
+        || project_id != project_id.trim()
+        || project_id == "."
+        || project_id == ".."
+        || project_id.contains("..")
+        || project_id.contains('/')
+        || project_id.contains('\\')
+        || project_id.contains('\0')
+    {
+        return Err(ConveyorError::InvalidConfig(
+            "project_id contains invalid path characters for project-scoped dispatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_and_pin_inputs(
     config: &StreamlineConfig,
-    input_paths: &[PathBuf],
-) -> Result<Vec<PathBuf>, InputScopeViolation> {
-    if input_paths.is_empty() {
+    req: &DispatchRequest,
+) -> Result<Vec<PinnedInputEntry>, InputPinError> {
+    if !req.caller_has_wildcard_scope {
+        validate_scoped_project_id(&req.project_id)
+            .map_err(|e| InputPinError::InvalidConfig(e.to_string()))?;
+    }
+
+    if req.input_paths.is_empty() {
         return Ok(Vec::new());
     }
 
-    let allowed_roots = config.effective_allowed_input_roots();
-    let canonical_roots: Vec<PathBuf> = allowed_roots
-        .iter()
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .collect();
-    if canonical_roots.is_empty() {
-        return Err(InputScopeViolation::OutsideAllowedRoot(
-            input_paths[0].display().to_string(),
+    let base_roots = config.effective_allowed_input_roots();
+    let mut pinned_roots = Vec::new();
+    let mut symlinked_roots = Vec::new();
+
+    for base_root in &base_roots {
+        if req.caller_has_wildcard_scope {
+            collect_wildcard_root(base_root, &mut pinned_roots, &mut symlinked_roots);
+        } else {
+            collect_project_scoped_root(
+                base_root,
+                &req.project_id,
+                &mut pinned_roots,
+                &mut symlinked_roots,
+            );
+        }
+    }
+
+    if pinned_roots.is_empty() && symlinked_roots.is_empty() {
+        return Err(InputPinError::OutsideAllowedRoot(
+            req.input_paths[0].display().to_string(),
         ));
     }
 
-    let mut validated = Vec::with_capacity(input_paths.len());
-    for input_path in input_paths {
+    let mut pinned_entries = Vec::with_capacity(req.input_paths.len());
+    for input_path in &req.input_paths {
         let display_path = input_path.display().to_string();
-        match fs::symlink_metadata(input_path) {
+        let trimmed_input = trim_trailing_slashes_and_dot(input_path);
+        let abs_input = to_abs_path(&trimmed_input)
+            .map_err(|_| InputPinError::OutsideAllowedRoot(display_path.clone()))?;
+
+        match fs::symlink_metadata(&trimmed_input) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
-                    return Err(InputScopeViolation::SymlinkRejected(display_path));
+                    return Err(InputPinError::SymlinkRejected(display_path));
                 }
-                if let Err(err) = verify_no_symlink_components(input_path) {
-                    match err {
-                        ConveyorError::MissingInput(_) => {
-                            validate_missing_path_scope(input_path, &canonical_roots)?;
-                            validated.push(input_path.clone());
-                            continue;
-                        }
-                        _ => return Err(InputScopeViolation::SymlinkRejected(display_path)),
+
+                let canonical_input = fs::canonicalize(&trimmed_input)
+                    .map_err(|_| InputPinError::OutsideAllowedRoot(display_path.clone()))?;
+
+                if matches_symlinked_root(&abs_input, Some(&canonical_input), &symlinked_roots) {
+                    return Err(InputPinError::SymlinkRejected(display_path));
+                }
+
+                let matched_root = select_deepest_matching_root(&pinned_roots, &canonical_input);
+
+                let Some(matched_root) = matched_root else {
+                    if let Some(err) =
+                        check_lexical_symlink_escape(&abs_input, &pinned_roots, &display_path)
+                    {
+                        return Err(err);
                     }
-                }
-                let canonical_input = fs::canonicalize(input_path)
-                    .map_err(|_| InputScopeViolation::OutsideAllowedRoot(display_path.clone()))?;
-                if !canonical_roots
-                    .iter()
-                    .any(|root| canonical_input.starts_with(root))
-                {
-                    return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
-                }
-                validated.push(canonical_input);
+                    return Err(InputPinError::OutsideAllowedRoot(display_path));
+                };
+
+                let segments = resolve_walk_segments(
+                    &trimmed_input,
+                    &abs_input,
+                    &canonical_input,
+                    matched_root,
+                    &display_path,
+                )?;
+                let entry = pin_entry_from_root(matched_root, &segments, &display_path)?;
+                pinned_entries.push(entry);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                validate_missing_path_scope(input_path, &canonical_roots)?;
-                validated.push(input_path.clone());
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if matches_symlinked_root(&abs_input, None, &symlinked_roots) {
+                    return Err(InputPinError::SymlinkRejected(display_path));
+                }
+                validate_missing_path_scope(&trimmed_input, &pinned_roots, &symlinked_roots)?;
+                return Err(InputPinError::MissingInput(display_path));
             }
             Err(_) => {
-                return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+                if matches_symlinked_root(&abs_input, None, &symlinked_roots) {
+                    return Err(InputPinError::SymlinkRejected(display_path));
+                }
+                return Err(InputPinError::OutsideAllowedRoot(display_path));
             }
         }
     }
 
-    Ok(validated)
+    Ok(pinned_entries)
+}
+
+fn select_deepest_matching_root<'a>(
+    pinned_roots: &'a [PinnedRoot],
+    canonical_input: &Path,
+) -> Option<&'a PinnedRoot> {
+    let mut best: Option<(&PinnedRoot, usize)> = None;
+    for item in pinned_roots {
+        if !canonical_input.starts_with(&item.canon_root) {
+            continue;
+        }
+        let depth = item.canon_root.components().count();
+        match best {
+            None => best = Some((item, depth)),
+            Some((_, best_depth)) if depth > best_depth => best = Some((item, depth)),
+            _ => {}
+        }
+    }
+    best.map(|(item, _)| item)
+}
+
+fn collect_wildcard_root(
+    raw_root: &Path,
+    pinned_roots: &mut Vec<PinnedRoot>,
+    symlinked_roots: &mut Vec<SymlinkedRoot>,
+) {
+    let trimmed = trim_trailing_slashes_and_dot(raw_root);
+    let Ok(abs_raw_root) = to_abs_path(&trimmed) else {
+        return;
+    };
+    match PinnedDir::open_existing_dir(&trimmed) {
+        Ok(dir) => {
+            if let Ok(canon_root) = fs::canonicalize(&trimmed) {
+                pinned_roots.push(PinnedRoot {
+                    abs_raw_root,
+                    canon_root,
+                    dir,
+                });
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            let is_sym = is_symlink_io_err(&err)
+                || fs::symlink_metadata(&trimmed)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+            if is_sym {
+                symlinked_roots.push(SymlinkedRoot {
+                    abs_raw_root,
+                    canon_root: fs::canonicalize(&trimmed).ok(),
+                });
+            }
+        }
+    }
+}
+
+fn collect_project_scoped_root(
+    base_root: &Path,
+    project_id: &str,
+    pinned_roots: &mut Vec<PinnedRoot>,
+    symlinked_roots: &mut Vec<SymlinkedRoot>,
+) {
+    let trimmed_base = trim_trailing_slashes_and_dot(base_root);
+    let scoped_raw = trimmed_base.join("projects").join(project_id);
+    let Ok(abs_raw_root) = to_abs_path(&scoped_raw) else {
+        return;
+    };
+
+    let base_dir = match PinnedDir::open_existing_dir(&trimmed_base) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            let is_sym = is_symlink_io_err(&err)
+                || fs::symlink_metadata(&trimmed_base)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+            if is_sym {
+                symlinked_roots.push(SymlinkedRoot {
+                    abs_raw_root,
+                    canon_root: fs::canonicalize(&scoped_raw).ok(),
+                });
+            }
+            return;
+        }
+    };
+
+    let projects_dir = match base_dir.open_subdir("projects") {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            if is_symlink_io_err(&err) {
+                symlinked_roots.push(SymlinkedRoot {
+                    abs_raw_root,
+                    canon_root: fs::canonicalize(&scoped_raw).ok(),
+                });
+            }
+            return;
+        }
+    };
+
+    match projects_dir.open_subdir(project_id) {
+        Ok(proj_dir) => {
+            if let Ok(canon_root) = fs::canonicalize(&scoped_raw) {
+                pinned_roots.push(PinnedRoot {
+                    abs_raw_root,
+                    canon_root,
+                    dir: proj_dir,
+                });
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            if is_symlink_io_err(&err) {
+                symlinked_roots.push(SymlinkedRoot {
+                    abs_raw_root,
+                    canon_root: fs::canonicalize(&scoped_raw).ok(),
+                });
+            }
+        }
+    }
+}
+
+fn is_symlink_io_err(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::InvalidInput && err.to_string().contains("symlinks are forbidden")
+}
+
+fn to_abs_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn matches_symlinked_root(
+    abs_input: &Path,
+    canonical_input: Option<&Path>,
+    symlinked_roots: &[SymlinkedRoot],
+) -> bool {
+    symlinked_roots.iter().any(|root| {
+        abs_input.starts_with(&root.abs_raw_root)
+            || match (canonical_input, root.canon_root.as_ref()) {
+                (Some(c_in), Some(c_root)) => c_in.starts_with(c_root),
+                _ => false,
+            }
+    })
+}
+
+fn extract_normal_segments(rel: &Path) -> Option<Vec<String>> {
+    let mut segs = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(seg) => segs.push(seg.to_str()?.to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(segs)
+}
+
+fn resolve_walk_segments(
+    trimmed_input: &Path,
+    abs_input: &Path,
+    canonical_input: &Path,
+    matched_root: &PinnedRoot,
+    display_path: &str,
+) -> Result<Vec<String>, InputPinError> {
+    if let Some(segs) = abs_input
+        .strip_prefix(&matched_root.abs_raw_root)
+        .ok()
+        .and_then(extract_normal_segments)
+    {
+        return Ok(segs);
+    }
+
+    if let Some(segs) = abs_input
+        .strip_prefix(&matched_root.canon_root)
+        .ok()
+        .and_then(extract_normal_segments)
+    {
+        return Ok(segs);
+    }
+
+    if let Err(err) = verify_no_symlink_components(trimmed_input) {
+        return match err {
+            ConveyorError::MissingInput(_) => {
+                Err(InputPinError::MissingInput(display_path.to_string()))
+            }
+            _ => Err(InputPinError::SymlinkRejected(display_path.to_string())),
+        };
+    }
+
+    canonical_input
+        .strip_prefix(&matched_root.canon_root)
+        .ok()
+        .and_then(extract_normal_segments)
+        .ok_or_else(|| InputPinError::OutsideAllowedRoot(display_path.to_string()))
+}
+
+fn check_lexical_symlink_escape(
+    abs_input: &Path,
+    pinned_roots: &[PinnedRoot],
+    display_path: &str,
+) -> Option<InputPinError> {
+    for root in pinned_roots {
+        let segs = abs_input
+            .strip_prefix(&root.abs_raw_root)
+            .ok()
+            .and_then(extract_normal_segments)
+            .or_else(|| {
+                abs_input
+                    .strip_prefix(&root.canon_root)
+                    .ok()
+                    .and_then(extract_normal_segments)
+            });
+        if let Some(segs) = segs {
+            if let Err(err @ InputPinError::SymlinkRejected(_)) =
+                pin_entry_from_root(root, &segs, display_path)
+            {
+                return Some(err);
+            }
+        }
+    }
+    None
+}
+
+fn pin_entry_from_root(
+    matched_root: &PinnedRoot,
+    segments: &[String],
+    display_path: &str,
+) -> Result<PinnedInputEntry, InputPinError> {
+    if segments.is_empty() {
+        let parent_path = matched_root
+            .canon_root
+            .parent()
+            .ok_or_else(|| InputPinError::OutsideAllowedRoot(display_path.to_string()))?;
+        let leaf_name = matched_root
+            .canon_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| InputPinError::OutsideAllowedRoot(display_path.to_string()))?
+            .to_string();
+        let parent_dir =
+            PinnedDir::open_existing_dir(parent_path).map_err(|e| map_walk_err(e, display_path))?;
+        verify_no_symlinks_pinned(&matched_root.dir, display_path)?;
+        return Ok(PinnedInputEntry {
+            parent_dir,
+            leaf_name: leaf_name.clone(),
+            staged_basename: leaf_name,
+        });
+    }
+
+    let (parent_dir, leaf_name) = if segments.len() == 1 {
+        let parent_dir = matched_root
+            .dir
+            .try_clone()
+            .map_err(|e| map_walk_err(e, display_path))?;
+        (parent_dir, segments[0].clone())
+    } else {
+        let mut cur = matched_root
+            .dir
+            .open_subdir(&segments[0])
+            .map_err(|e| map_walk_err(e, display_path))?;
+        for seg in &segments[1..segments.len() - 1] {
+            cur = cur
+                .open_subdir(seg)
+                .map_err(|e| map_walk_err(e, display_path))?;
+        }
+        (cur, segments[segments.len() - 1].clone())
+    };
+
+    match parent_dir.is_regular_file_nofollow(&leaf_name) {
+        Ok(true) => {}
+        Ok(false) => {
+            let sub_dir = parent_dir
+                .open_subdir(&leaf_name)
+                .map_err(|e| map_walk_err(e, display_path))?;
+            verify_no_symlinks_pinned(&sub_dir, display_path)?;
+        }
+        Err(err) => return Err(map_walk_err(err, display_path)),
+    }
+
+    Ok(PinnedInputEntry {
+        parent_dir,
+        leaf_name: leaf_name.clone(),
+        staged_basename: leaf_name,
+    })
+}
+
+fn verify_no_symlinks_pinned(dir: &PinnedDir, display_path: &str) -> Result<(), InputPinError> {
+    let names = dir
+        .list_entry_names()
+        .map_err(|e| map_walk_err(e, display_path))?;
+    for name in names {
+        match dir.is_regular_file_nofollow(&name) {
+            Ok(true) => {}
+            Ok(false) => {
+                let sub = dir
+                    .open_subdir(&name)
+                    .map_err(|e| map_walk_err(e, display_path))?;
+                verify_no_symlinks_pinned(&sub, display_path)?;
+            }
+            Err(err) => return Err(map_walk_err(err, display_path)),
+        }
+    }
+    Ok(())
+}
+
+fn map_walk_err(err: io::Error, display_path: &str) -> InputPinError {
+    if err.kind() == io::ErrorKind::NotFound {
+        InputPinError::MissingInput(display_path.to_string())
+    } else if err.kind() == io::ErrorKind::InvalidInput {
+        InputPinError::SymlinkRejected(display_path.to_string())
+    } else {
+        InputPinError::OutsideAllowedRoot(display_path.to_string())
+    }
 }
 
 fn validate_missing_path_scope(
     input_path: &Path,
-    canonical_roots: &[PathBuf],
-) -> Result<(), InputScopeViolation> {
+    pinned_roots: &[PinnedRoot],
+    symlinked_roots: &[SymlinkedRoot],
+) -> Result<(), InputPinError> {
     let display_path = input_path.display().to_string();
-    let abs_path = if input_path.is_absolute() {
-        input_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|_| InputScopeViolation::OutsideAllowedRoot(display_path.clone()))?
-            .join(input_path)
-    };
+    let abs_path = to_abs_path(input_path)
+        .map_err(|_| InputPinError::OutsideAllowedRoot(display_path.clone()))?;
 
     let mut existing = abs_path.as_path();
     let mut tail_segments: Vec<OsString> = Vec::new();
-    while fs::symlink_metadata(existing).is_err() {
-        let mut comps = existing.components();
-        let Some(last) = comps.next_back() else {
-            return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
-        };
-        match last {
-            Component::Normal(seg) => tail_segments.push(seg.to_os_string()),
-            Component::ParentDir => tail_segments.push(OsString::from("..")),
-            Component::CurDir => {}
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+    let existing_meta = loop {
+        match fs::symlink_metadata(existing) {
+            Ok(meta) => break meta,
+            Err(_) => {
+                let mut comps = existing.components();
+                let Some(last) = comps.next_back() else {
+                    return Err(InputPinError::OutsideAllowedRoot(display_path));
+                };
+                match last {
+                    Component::Normal(seg) => tail_segments.push(seg.to_os_string()),
+                    Component::ParentDir => tail_segments.push(OsString::from("..")),
+                    Component::CurDir => {}
+                    Component::RootDir | Component::Prefix(_) => {
+                        return Err(InputPinError::OutsideAllowedRoot(display_path));
+                    }
+                }
+                existing = comps.as_path();
+                if existing.as_os_str().is_empty() {
+                    return Err(InputPinError::OutsideAllowedRoot(display_path));
+                }
             }
         }
-        existing = comps.as_path();
-        if existing.as_os_str().is_empty() {
-            return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
-        }
+    };
+
+    if existing_meta.file_type().is_symlink() {
+        return Err(InputPinError::SymlinkRejected(display_path));
     }
 
     let mut resolved = fs::canonicalize(existing)
-        .map_err(|_| InputScopeViolation::OutsideAllowedRoot(display_path.clone()))?;
+        .map_err(|_| InputPinError::OutsideAllowedRoot(display_path.clone()))?;
     for seg in tail_segments.into_iter().rev() {
         if seg == ".." {
             if !resolved.pop() {
-                return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+                return Err(InputPinError::OutsideAllowedRoot(display_path));
             }
         } else if seg != "." {
             resolved.push(seg);
         }
     }
 
-    if !canonical_roots
+    if matches_symlinked_root(&abs_path, Some(&resolved), symlinked_roots) {
+        return Err(InputPinError::SymlinkRejected(display_path));
+    }
+
+    if !pinned_roots
         .iter()
-        .any(|root| resolved.starts_with(root))
+        .any(|root| resolved.starts_with(&root.canon_root))
     {
-        return Err(InputScopeViolation::OutsideAllowedRoot(display_path));
+        return Err(InputPinError::OutsideAllowedRoot(display_path));
     }
     Ok(())
 }

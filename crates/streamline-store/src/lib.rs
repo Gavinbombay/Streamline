@@ -1273,7 +1273,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                 actor_is_custodian: false,
             },
         );
-        assert!(matches!(unbound_none, Err(StoreError::InvalidState(_))));
+        assert!(matches!(unbound_none, Err(StoreError::ForbiddenRole(_))));
 
         let built = store
             .update_requirement_stage(
@@ -1289,6 +1289,38 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
             )
             .expect("bound worker marks T without caller actor_family");
         assert_eq!(built.builder_family.as_deref(), Some("openai-codex"));
+
+        let owner_spoof_accept = store.update_requirement_stage(
+            &owner.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-family-gate".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::A,
+                evidence_ref: "owner unbound spoof".to_string(),
+                actor_family: Some("google-gemini".to_string()),
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(
+            owner_spoof_accept,
+            Err(StoreError::ForbiddenRole(_))
+        ));
+
+        let owner_unbound_accept = store.update_requirement_stage(
+            &owner.grant_id,
+            UpdateRequirementStageRequest {
+                project_id: "proj-family-gate".to_string(),
+                req_id: "REQ-01".to_string(),
+                target_stage: ReqStage::A,
+                evidence_ref: "owner unbound none".to_string(),
+                actor_family: None,
+                actor_is_custodian: false,
+            },
+        );
+        assert!(matches!(
+            owner_unbound_accept,
+            Err(StoreError::ForbiddenRole(_))
+        ));
 
         let spoof_accept = store.update_requirement_stage(
             &codex_peer.grant_id,
@@ -1468,6 +1500,58 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
         assert_eq!(real_pass.verdict, SyncVerdict::Pass);
         assert_eq!(real_pass.asbuilt_rev, 2);
         assert!(real_pass.paired_rows[0].matched);
+
+        let owner_unbound_sync =
+            store.compute_and_save_sync_report(&owner.grant_id, "proj-sync-verify", None);
+        assert!(matches!(
+            owner_unbound_sync,
+            Err(StoreError::ForbiddenRole(_))
+        ));
+
+        store
+            .save_resource(
+                &worker.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "projects".to_string(),
+                    slug: "proj-sync-verify-as_built".to_string(),
+                    title: "Sync Verify: as_built".to_string(),
+                    body_md: "# As Built\n\n\
+                              | REQ-01 | A | Bound 127.0.0.1 | test:loopback |\n\
+                              | REQ-99 | A | Extra unmapped claim | test:extra |\n"
+                        .to_string(),
+                    project_id: Some("proj-sync-verify".to_string()),
+                    trio_role: Some("as_built".to_string()),
+                    lifecycle_tier: Some(LifecycleTier::Active),
+                    triage_state: Some(TriageState::Reviewed),
+                    summary: "Add unmapped REQ-99 claim in as_built".to_string(),
+                    expected_rev: Some(2),
+                },
+            )
+            .expect("update as_built with unmapped claim");
+
+        let partial_report = store
+            .save_sync_report(
+                &acceptor.grant_id,
+                SaveSyncReportRequest {
+                    project_id: "proj-sync-verify".to_string(),
+                    plan_rev: 1,
+                    asbuilt_rev: 3,
+                    paired_rows: Vec::new(),
+                    verdict: SyncVerdict::Pass,
+                    acceptor_family: "google-gemini".to_string(),
+                },
+            )
+            .expect("save partial sync report");
+        assert_eq!(partial_report.verdict, SyncVerdict::Partial);
+        let fetched_partial = store
+            .get_sync_report(
+                &acceptor.grant_id,
+                "proj-sync-verify",
+                Some(&partial_report.report_id),
+            )
+            .expect("get partial report")
+            .expect("partial report persisted");
+        assert_eq!(fetched_partial.verdict, SyncVerdict::Partial);
     }
 
     #[test]
@@ -1625,6 +1709,21 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
         assert!(store
             .read_resource(&owner.grant_id, "standards", "escape")
             .is_err());
+        assert_eq!(
+            fs::read_to_string(&outside_file).expect("read outside"),
+            "DO_NOT_READ_OR_OVERWRITE\n"
+        );
+
+        fs::remove_file(standards_dir.join("escape.md")).expect("remove shelf symlink");
+        let lessons_dir = vault_dir.join("lessons");
+        fs::create_dir_all(&lessons_dir).expect("create lessons dir");
+        std::os::unix::fs::symlink(&outside_file, lessons_dir.join("escape.md"))
+            .expect("plant lessons symlink");
+        let lessons_err = store.sync_vault_dir(&vault_dir);
+        assert!(matches!(
+            lessons_err,
+            Err(StoreError::InvalidInput(ref msg)) if msg.contains("symlink")
+        ));
         assert_eq!(
             fs::read_to_string(&outside_file).expect("read outside"),
             "DO_NOT_READ_OR_OVERWRITE\n"

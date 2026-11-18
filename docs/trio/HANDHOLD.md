@@ -38,7 +38,7 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 | `REQ-13` | `OWN-004` | `/downloads/streamline-skills.zip` serves validated `director`, `worker`, `acceptor`, and `vault` skills | Archive byte & PKZIP CRC check | X | X | X | X | X |
 | `REQ-14` | `OWN-005` | 3-pane Web UI preserves exact Streamline dark palette, `16px`/`14px` floors, `44px` targets, and expanded word diffs | DOM/CSS assertion suite | X | X | X | X | X |
 | `REQ-15` | `OWN-006` | Open-source UI renders default status mark while loading private Presence canvas only when `presence_plugin_dir` is configured | Plugin mount isolation test | X | X | X | X | X |
-| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, and `AUDIT.md` PASS | Hygiene scan `0/0/0`; Luna `AUDIT.md` parked for pre-push | X | X | X | | |
+| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, optional `scripts/pre-push` release-hygiene hook, and `AUDIT.md` PASS | Hygiene scan `0/0/0`; optional local `scripts/pre-push` hook (`HOLD_PUSH`); Git host protections configured separately | X | X | X | | |
 | `REQ-17` | `OWN-011` | Closeout enforces verified temp cleanup (`mark_project_cleanup_verified`), forward lessons in the central `lessons_learned` DB (`record_lesson` / `query_lessons`), and plain-English non-technical `HOW-IT-WORKS.md` approval | Store + MCP closeout gate + `3` live central lessons | X | X | X | X | X |
 
 ## 3. Four-Gate Independent Acceptance (`L10`)
@@ -50,18 +50,18 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 
 ## 4. Custody, `HOLD_PUSH`, and Cleanup (`L12`, `L13`)
 
-- **Local Git Custody**: Initialized at `/srv/streamline` on the local build host (`git config user.name "[owner]"`, `git config user.email "owner@example.com"`).
-- **`HOLD_PUSH` Enforced Mechanically**: No GitHub remote is configured during build, and `.git/hooks/pre-push` exits nonzero (`HOLD_PUSH active`) until `AUDIT.md` passes, the Streamline logo assets land in `docs/assets/`, `HOW-IT-WORKS.md` is owner-approved, and the owner gives an explicit push command.
+- **Local Git Custody**: Initialized in the local repository (`git config user.name "[owner]"`, `git config user.email "owner@example.com"`).
+- **Optional `HOLD_PUSH` Release-Hygiene Hook (`scripts/pre-push`)**: No GitHub remote is configured during build. Maintainers may enable the committed `scripts/pre-push` hook locally (`git config core.hooksPath scripts`), which exits nonzero (`HOLD_PUSH active`) until `AUDIT.md` exists at the repository root and `STREAMLINE_ALLOW_PUSH=1` is set explicitly. This local hook is an optional maintainer release-hygiene convenience, NOT a runtime security boundary or server-enforced control; repository hosting branch and tag protections must be configured independently on the Git host.
 - **Per-Slice `CLEANUP`**: Scratch probes and temporary test DBs run under ephemeral temp dirs removed on exit; `cargo clean` or shared target pruning keeps disk usage well below the `60%` yellow mark.
 
 ## 5. Ordered Execution Checklist (`L15`)
 
 | # | Phase | Role | Action | Observable / Evidence | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `C-01` | Preflight | Director | Verify `rustc 1.98.1`, free disk, and initialize `/srv/streamline` with `[owner]` git identity + `pre-push` `HOLD_PUSH` hook | Commit `b853154d0b60` + hook exit check | PASS |
+| `C-01` | Preflight | Director | Verify `rustc 1.98.1`, free disk, and initialize the local repository with `[owner]` git identity + `scripts/pre-push` `HOLD_PUSH` release-hygiene hook | Commit `b853154d0b60` + hook exit check | PASS |
 | `C-02` | Slice 1 | Worker | Implement `streamline-{core,safe,store,http}` + 4 skills zip + unit/integration tests | `cargo test --workspace` `30/30` rc `0` + Clippy `0` | PASS |
 | `C-03` | Slice 1 | Acceptor | Connect live MCP; execute real `P1` Trio+ lifecycle, `2,933`-item legacy import, `bootstrap` fencing, central lessons, and skills zip verification | Live loopback MCP e2e (`200`, `0` temp files left) | PASS |
 | `C-04` | Slice 2 | Worker | Implement `streamline-conveyor` (read-only stage, runner, cleanup/scan gate, cross-family QC, JSONL export) | `12/12` conveyor e2e tests (`conveyor-closeout.svg`) | PASS |
 | `C-05` | Slice 3 | Worker | Implement 3-pane Web UI + `presence_plugin_dir` hook + `Beacon`-style README, captures, and `HOW-IT-WORKS.md` | `10/10` HTTP/UI tests (`mcp-policy.svg`), `streamline.service` active, `cargo clean` `2.6 GiB` freed | PASS |
-| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` (`Codex Luna`) + zero-hit scan right before GitHub push | Parked until owner triggers GitHub push | PARKED |
+| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` (`Codex Luna`) + zero-hit scan right before GitHub push; configure Git host branch/tag protections independently of local `scripts/pre-push` | Parked until owner triggers GitHub push | PARKED |
 | `C-07` | Closeout | Owner | Review plain-English `HOW-IT-WORKS.md` (`DOC-PENDING-OWNER`); later supply logo assets and decide on GitHub push | Owner approved `HOW-IT-WORKS.md` (`2026-11-18`) | PASS |

@@ -23,9 +23,7 @@ pub use state::AppState;
 pub use tools::{tools_list, McpToolDescriptor, ReadyStatus};
 
 pub(crate) fn is_verified_real_dir(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|meta| !meta.file_type().is_symlink() && meta.is_dir())
-        .unwrap_or(false)
+    streamline_safe::PinnedDir::open_existing_dir(path).is_ok()
 }
 
 fn plugin_content_type(asset_path: &std::path::Path) -> &'static str {
@@ -50,38 +48,24 @@ fn load_verified_plugin_asset(
     plugin_dir: &std::path::Path,
     asset_rel: &str,
 ) -> Option<(&'static str, Vec<u8>)> {
-    if !is_verified_real_dir(plugin_dir) {
-        return None;
-    }
-    let canon_root = std::fs::canonicalize(plugin_dir).ok()?;
     let trimmed = asset_rel.trim_start_matches('/');
     if trimmed.is_empty() || trimmed.contains('\\') || trimmed.contains('\0') {
         return None;
     }
-    let mut candidate = plugin_dir.to_path_buf();
-    for segment in trimmed.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('.') {
-            return None;
-        }
-        candidate.push(segment);
-        let meta = std::fs::symlink_metadata(&candidate).ok()?;
-        if meta.file_type().is_symlink() {
-            return None;
-        }
-    }
-    let final_meta = std::fs::symlink_metadata(&candidate).ok()?;
-    if final_meta.file_type().is_symlink()
-        || !final_meta.is_file()
-        || final_meta.len() > 4 * 1024 * 1024
+    let segments: Vec<&str> = trimmed.split('/').collect();
+    if segments
+        .iter()
+        .any(|seg| seg.is_empty() || *seg == "." || *seg == ".." || seg.starts_with('.'))
     {
         return None;
     }
-    let canon_file = std::fs::canonicalize(&candidate).ok()?;
-    if !canon_file.starts_with(&canon_root) {
-        return None;
+    let (leaf, parents) = segments.split_last()?;
+    let mut dir = streamline_safe::PinnedDir::open_existing_dir(plugin_dir).ok()?;
+    for seg in parents {
+        dir = dir.open_subdir(seg).ok()?;
     }
-    let bytes = std::fs::read(&canon_file).ok()?;
-    Some((plugin_content_type(&canon_file), bytes))
+    let bytes = dir.read_bytes_nofollow(leaf, 4 * 1024 * 1024).ok()?;
+    Some((plugin_content_type(std::path::Path::new(leaf)), bytes))
 }
 
 /// Builds the complete Axum router for Streamline HTTP, MCP, skills archive, and Web UI.
