@@ -61,7 +61,7 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 | `C-01` | Preflight | Director | Verify `rustc 1.98.1`, free disk, and initialize `/srv/streamline` with `[owner]` git identity + `pre-push` `HOLD_PUSH` hook | Commit `b853154d0b60` + hook exit check | PASS |
 | `C-02` | Slice 1 | Worker | Implement `streamline-{core,safe,store,http}` + 4 skills zip + unit/integration tests | `cargo test --workspace` `30/30` rc `0` + Clippy `0` | PASS |
 | `C-03` | Slice 1 | Acceptor | Connect live MCP; execute real `P1` Trio+ lifecycle, `2,933`-item legacy import, `bootstrap` fencing, central lessons, and skills zip verification | Live loopback MCP e2e (`200`, `0` temp files left) | PASS |
-| `C-04` | Slice 2 | Worker | Implement `streamline-conveyor` (read-only stage, runner, cleanup/scan gate, cross-family QC, JSONL export) | Conveyor e2e test log | PENDING |
-| `C-05` | Slice 3 | Worker | Implement 3-pane Web UI + `presence_plugin_dir` hook + `Beacon`-style README, captures, and `HOW-IT-WORKS.md` | DOM tests + SVG captures | PENDING |
-| `C-06` | Audit | Acceptor | Run 6-phase security audit + secret/identity/IP zero-hit scan across entire git history | `AUDIT.md` + scanner `0/0/0` | PENDING |
-| `C-07` | Closeout | Owner | Supply Streamline logo assets in `docs/assets/`, review `HOW-IT-WORKS.md`, and decide on creating/pushing `Gavinbombay/Streamline` | Owner sign-off | PENDING |
+| `C-04` | Slice 2 | Worker | Implement `streamline-conveyor` (read-only stage, runner, cleanup/scan gate, cross-family QC, JSONL export) | `12/12` conveyor e2e tests (`conveyor-closeout.svg`) | PASS |
+| `C-05` | Slice 3 | Worker | Implement 3-pane Web UI + `presence_plugin_dir` hook + `Beacon`-style README, captures, and `HOW-IT-WORKS.md` | `10/10` HTTP/UI tests (`mcp-policy.svg`), `streamline.service` active, `cargo clean` `2.6 GiB` freed | PASS |
+| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` (`Codex Luna`) + zero-hit scan right before GitHub push | Parked until owner triggers GitHub push | PARKED |
+| `C-07` | Closeout | Owner | Review plain-English `HOW-IT-WORKS.md` (`DOC-PENDING-OWNER`); later supply logo assets and decide on GitHub push | `HOW-IT-WORKS.md` ready for owner review | DOC-PENDING-OWNER |

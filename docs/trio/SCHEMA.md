@@ -118,12 +118,12 @@ Failure/stop branches:
 
 ## 6. As-Built Ledger (`L14`)
 
-*Status at `0.1.0-s1`: Slice 1 implemented, unit/integration tested (`30 passed, 0 failed` at `26ba4990988a`), and verified end to end over live loopback HTTP/MCP (`127.0.0.1:15880`).*
+*Status at `0.1.0` (`DOC-PENDING-OWNER`): Slices 1, 2, and 3 implemented, tested (`43 passed, 0 failed`), and running live as `streamline.service` (`127.0.0.1:5880`) with `2,933` imported legacy records, `3` forward lessons in `lessons_learned`, and `2,937` synced vault markdown files.*
 
 | Component | Target Location | State | Evidence |
 | :--- | :--- | :--- | :--- |
-| `streamline-core` | `crates/streamline-core` | `A` | `7/7` unit tests + Clippy `0` warnings |
-| `streamline-safe` | `crates/streamline-safe` | `A` | `8/8` redaction/IP/segment tests + `422` live MCP block |
-| `streamline-store` | `crates/streamline-store` | `A` | `6/6` SQLite/vault/legacy/lessons tests + `2,933`-item legacy import e2e |
-| `streamline-conveyor` | `crates/streamline-conveyor` | `T` | Cross-family guard + manifest/cleanup helpers (`1/1` test; Slice 2 expands runner) |
-| `streamline-http` | `crates/streamline-http` | `A` | `8/8` HTTP/MCP/skills-zip/UI tests + live loopback MCP e2e |
+| `streamline-core` | `crates/streamline-core` | `L` | `7/7` unit tests + Clippy `0` warnings |
+| `streamline-safe` | `crates/streamline-safe` | `L` | `8/8` redaction/IP/segment tests + `422` live MCP block |
+| `streamline-store` | `crates/streamline-store` | `L` | `6/6` SQLite/vault/legacy/lessons tests + `2,937`-file live vault sync |
+| `streamline-conveyor` | `crates/streamline-conveyor` | `L` | `12/12` read-only stage, quarantine, 2-strike impasse, cross-family QC, and JSONL trajectory tests |
+| `streamline-http` | `crates/streamline-http` | `L` | `10/10` HTTP/MCP/3-pane UI/conveyor tests + live `streamline.service` `/ready` `200` |

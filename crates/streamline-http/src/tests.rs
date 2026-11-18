@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use serde_json::{json, Value};
-use streamline_core::{PrincipalRole, StreamlineConfig};
+use streamline_core::{HarnessSpec, PrincipalRole, StreamlineConfig};
 use streamline_store::{CreateGrantRequest, StreamlineStore};
 use tower::ServiceExt;
 
@@ -837,4 +837,452 @@ fn stdio_mcp_dispatcher_supports_param_credential_and_notifications() {
     assert!(!is_err);
     assert_eq!(parsed["ok"], true);
     assert!(parsed["data"]["rules_sha256"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
+    let temp = TempDirGuard::new("streamline-conveyor-mcp");
+    let runs_dir = temp.path.join("runs");
+    let vault_dir = temp.path.join("vault");
+    let input_dir = temp.path.join("inputs");
+    fs::create_dir_all(&runs_dir).expect("create runs dir");
+    fs::create_dir_all(&vault_dir).expect("create vault dir");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+    let input_file = input_dir.join("spec.md");
+    fs::write(
+        &input_file,
+        "# Conveyor Spec\n\nLoopback bind 127.0.0.1:5880.\n",
+    )
+    .expect("write input spec");
+
+    let config = StreamlineConfig {
+        runs_dir: runs_dir.display().to_string(),
+        vault_sync_dir: vault_dir.display().to_string(),
+        harnesses: vec![
+            HarnessSpec {
+                id: "codex-sh".to_string(),
+                family: "openai-codex".to_string(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'builder-ok\\n'".to_string(),
+                ],
+                max_concurrency: 1,
+            },
+            HarnessSpec {
+                id: "gemini-sh".to_string(),
+                family: "google-gemini".to_string(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'acceptor-ok\\n'".to_string(),
+                ],
+                max_concurrency: 1,
+            },
+        ],
+        ..StreamlineConfig::default()
+    };
+
+    let state = make_test_state(config);
+    let rules_sha = state.store.current_rules_sha256().expect("rules sha");
+
+    let owner_cred = "cred-conveyor-owner";
+    let worker_cred = "cred-conveyor-worker";
+    let acceptor_cred = "cred-conveyor-acceptor";
+    let no_dispatch_cred = "cred-conveyor-nodispatch";
+
+    let owner_grant = seed_grant(
+        &state.store,
+        "owner-conveyor",
+        PrincipalRole::Owner,
+        owner_cred,
+        vec!["*".to_string()],
+    );
+    let worker_grant = seed_grant(
+        &state.store,
+        "worker-conveyor",
+        PrincipalRole::Agent,
+        worker_cred,
+        vec!["*".to_string()],
+    );
+    let acceptor_grant = seed_grant(
+        &state.store,
+        "acceptor-conveyor",
+        PrincipalRole::Agent,
+        acceptor_cred,
+        vec!["*".to_string()],
+    );
+
+    state
+        .store
+        .upsert_principal("nodispatch-agent", "nodispatch-agent", PrincipalRole::Agent)
+        .expect("upsert nodispatch principal");
+    let no_dispatch_grant = state
+        .store
+        .create_grant(CreateGrantRequest {
+            grant_id: Some("grant-nodispatch".to_string()),
+            principal_id: "nodispatch-agent".to_string(),
+            raw_credential: no_dispatch_cred.to_string(),
+            granted_tags: vec!["*".to_string()],
+            can_write: true,
+            can_dispatch: false,
+            expires_at: None,
+        })
+        .expect("create no_dispatch grant")
+        .grant_id;
+
+    state.store.ack_rules(&owner_grant, &rules_sha).unwrap();
+    state.store.ack_rules(&worker_grant, &rules_sha).unwrap();
+    state.store.ack_rules(&acceptor_grant, &rules_sha).unwrap();
+    state
+        .store
+        .ack_rules(&no_dispatch_grant, &rules_sha)
+        .unwrap();
+
+    let app = build_router(state);
+
+    let create_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        101,
+        "create_trio_project",
+        json!({
+            "project_id": "conveyor-demo",
+            "request_id": "req-conveyor-001",
+            "title": "Conveyor Dispatch Demo",
+            "assessment": {
+                "d1_scope": 2,
+                "d2_interfaces": 1,
+                "d3_uncertainty": 1,
+                "d4_ui": 0,
+                "d5_novelty": 1,
+                "r1_exposure": 2,
+                "r2_irreversibility": 1,
+                "r3_blast_radius": 1,
+                "r4_evidence": 1,
+                "r5_custody": 1,
+                "work_kind": "software"
+            },
+            "initial_own_decisions": [
+                { "own_id": "OWN-001", "statement": "Bind loopback 127.0.0.1:5880" }
+            ],
+            "initial_requirements": [
+                { "req_id": "REQ-01", "source_id": "OWN-001", "statement": "Run build and cross-family accept cleanly" }
+            ]
+        }),
+    )
+    .await;
+    let (create_err, create_data) = parse_mcp_tool_text(&create_resp);
+    assert!(!create_err, "create failed: {create_data}");
+    assert_eq!(create_data["data"]["project"]["risk"], 2);
+
+    // Grant with can_dispatch = false must receive 403 FORBIDDEN on dispatch_run.
+    let forbidden_dispatch_req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/tools/dispatch_run")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Streamline-Credential", no_dispatch_cred)
+        .body(Body::from(
+            json!({
+                "project_id": "conveyor-demo",
+                "input_paths": [input_file.display().to_string()]
+            })
+            .to_string(),
+        ))
+        .expect("build forbidden dispatch request");
+    let (forbidden_status, forbidden_body) =
+        read_json_body(app.clone().oneshot(forbidden_dispatch_req).await.unwrap()).await;
+    assert_eq!(forbidden_status, StatusCode::FORBIDDEN);
+    assert_eq!(forbidden_body["error"]["code"], "FORBIDDEN");
+
+    // Dispatch risk = 2 build + auto cross-family accept via MCP dispatch_run.
+    let dispatch_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        102,
+        "dispatch_run",
+        json!({
+            "project_id": "conveyor-demo",
+            "input_paths": [input_file.display().to_string()],
+            "preferred_builder_harness": "codex-sh"
+        }),
+    )
+    .await;
+    let (dispatch_err, dispatch_data) = parse_mcp_tool_text(&dispatch_resp);
+    assert!(!dispatch_err, "dispatch_run failed: {dispatch_data}");
+
+    let build_run = &dispatch_data["data"]["build_run"];
+    let build_run_id = build_run["run_id"]
+        .as_str()
+        .expect("build_run.run_id")
+        .to_string();
+    assert_eq!(build_run["project_id"], "conveyor-demo");
+    assert_eq!(build_run["phase"], "build");
+    assert_eq!(build_run["family"], "openai-codex");
+    assert_eq!(build_run["cleanup_clean"], true);
+    assert_eq!(build_run["scan_clean"], true);
+
+    let accept_run = &dispatch_data["data"]["accept_run"];
+    assert!(
+        accept_run.is_object(),
+        "risk = 2 dispatch must auto-trigger cross-family accept_run"
+    );
+    let accept_run_id = accept_run["run_id"]
+        .as_str()
+        .expect("accept_run.run_id")
+        .to_string();
+    assert_eq!(accept_run["phase"], "accept");
+    assert_eq!(accept_run["family"], "google-gemini");
+    assert_eq!(accept_run["cleanup_clean"], true);
+    assert_eq!(accept_run["scan_clean"], true);
+
+    // Verify get_run_status for build and accept runs.
+    let status_build_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        103,
+        "get_run_status",
+        json!({ "run_id": build_run_id }),
+    )
+    .await;
+    let (status_build_err, status_build_data) = parse_mcp_tool_text(&status_build_resp);
+    assert!(!status_build_err, "get_run_status build failed: {status_build_data}");
+    assert_eq!(status_build_data["data"]["run_id"], build_run_id);
+    assert_eq!(status_build_data["data"]["phase"], "build");
+
+    let status_accept_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        104,
+        "get_run_status",
+        json!({ "run_id": accept_run_id }),
+    )
+    .await;
+    let (status_accept_err, status_accept_data) = parse_mcp_tool_text(&status_accept_resp);
+    assert!(
+        !status_accept_err,
+        "get_run_status accept failed: {status_accept_data}"
+    );
+    assert_eq!(status_accept_data["data"]["run_id"], accept_run_id);
+    assert_eq!(status_accept_data["data"]["phase"], "accept");
+
+    // Verify list_conveyor_runs returns both persisted runs for the project.
+    let list_runs_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        105,
+        "list_conveyor_runs",
+        json!({ "project_id": "conveyor-demo" }),
+    )
+    .await;
+    let (list_runs_err, list_runs_data) = parse_mcp_tool_text(&list_runs_resp);
+    assert!(!list_runs_err, "list_conveyor_runs failed: {list_runs_data}");
+    let runs_arr = list_runs_data["data"].as_array().expect("runs array");
+    assert_eq!(runs_arr.len(), 2);
+    assert!(runs_arr.iter().any(|r| r["run_id"] == build_run_id));
+    assert!(runs_arr.iter().any(|r| r["run_id"] == accept_run_id));
+
+    // Advance REQ-01 through T and cross-family A, then complete 3-part closeout.
+    let req_t = mcp_call(
+        &app,
+        Some(worker_cred),
+        106,
+        "update_requirement_stage",
+        json!({
+            "project_id": "conveyor-demo",
+            "req_id": "REQ-01",
+            "target_stage": "T",
+            "evidence_ref": "conveyor build clean",
+            "actor_family": "openai-codex"
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&req_t).0);
+
+    let req_a = mcp_call(
+        &app,
+        Some(acceptor_cred),
+        107,
+        "update_requirement_stage",
+        json!({
+            "project_id": "conveyor-demo",
+            "req_id": "REQ-01",
+            "target_stage": "A",
+            "evidence_ref": "cross-family gemini accept clean",
+            "actor_family": "google-gemini"
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&req_a).0);
+
+    let cleanup_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        108,
+        "mark_project_cleanup_verified",
+        json!({
+            "project_id": "conveyor-demo",
+            "detail": "temporary staging artifacts verified clean"
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&cleanup_resp).0);
+
+    let lesson_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        109,
+        "record_lesson",
+        json!({
+            "project_id": "conveyor-demo",
+            "tags": ["conveyor", "cross-family"],
+            "observed_fact": "Cross-family R2 acceptance enforces distinct harness families cleanly.",
+            "cause_kind": "demonstrated",
+            "cause_note": "Verified over MCP dispatch_run.",
+            "forward_rule": "Always pair R2+ builds with an independent acceptor family."
+        }),
+    )
+    .await;
+    assert!(!parse_mcp_tool_text(&lesson_resp).0);
+
+    let how_resp = mcp_call(
+        &app,
+        Some(worker_cred),
+        110,
+        "submit_how_it_works",
+        json!({
+            "project_id": "conveyor-demo",
+            "markdown": valid_how_it_works_doc()
+        }),
+    )
+    .await;
+    let (how_err, how_data) = parse_mcp_tool_text(&how_resp);
+    assert!(!how_err, "submit_how_it_works failed: {how_data}");
+    assert_eq!(how_data["data"]["state"], "DOC_PENDING_OWNER");
+
+    let approve_resp = mcp_call(
+        &app,
+        Some(owner_cred),
+        111,
+        "approve_release",
+        json!({ "project_id": "conveyor-demo" }),
+    )
+    .await;
+    let (approve_err, approve_data) = parse_mcp_tool_text(&approve_resp);
+    assert!(!approve_err, "approve_release failed: {approve_data}");
+    assert_eq!(approve_data["data"]["project"]["state"], "DONE");
+    assert_eq!(approve_data["data"]["requirements"][0]["stage"], "L");
+
+    // Verify trajectories.jsonl was written cleanly on approve_release.
+    let traj_path = runs_dir.join("trajectories.jsonl");
+    assert!(
+        traj_path.exists(),
+        "approve_release must append trajectory to trajectories.jsonl"
+    );
+    let traj_text = fs::read_to_string(&traj_path).expect("read trajectories.jsonl");
+    let lines: Vec<&str> = traj_text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty(), "trajectories.jsonl must contain a line");
+    let first_entry: Value =
+        serde_json::from_str(lines[0]).expect("parse trajectory JSONL entry");
+    assert_eq!(first_entry["project_id"], "conveyor-demo");
+
+    // Non-owner cannot call export_trajectory; owner can.
+    let worker_export = mcp_call(
+        &app,
+        Some(worker_cred),
+        112,
+        "export_trajectory",
+        json!({ "project_id": "conveyor-demo" }),
+    )
+    .await;
+    assert!(parse_mcp_tool_text(&worker_export).0);
+
+    let owner_export = mcp_call(
+        &app,
+        Some(owner_cred),
+        113,
+        "export_trajectory",
+        json!({ "project_id": "conveyor-demo" }),
+    )
+    .await;
+    let (owner_export_err, owner_export_data) = parse_mcp_tool_text(&owner_export);
+    assert!(!owner_export_err, "export_trajectory failed: {owner_export_data}");
+    assert_eq!(owner_export_data["data"]["project_id"], "conveyor-demo");
+    assert!(owner_export_data["data"]["trajectory_file"]
+        .as_str()
+        .unwrap_or_default()
+        .ends_with("trajectories.jsonl"));
+}
+
+#[tokio::test]
+async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
+    let state = make_test_state(StreamlineConfig::default());
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/?panel=passport")
+                .body(Body::empty())
+                .expect("build UI request"),
+        )
+        .await
+        .expect("call UI handler");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read UI HTML bytes");
+    let html = String::from_utf8(bytes.to_vec()).expect("valid UTF-8 HTML");
+
+    // Verify all 6 sidebar navigation tabs.
+    for nav_tab in [
+        "data-view=\"overview\"",
+        "data-view=\"projects\"",
+        "data-view=\"shelves\"",
+        "data-view=\"inbox\"",
+        "data-view=\"lessons\"",
+        "data-view=\"apps\"",
+    ] {
+        assert!(html.contains(nav_tab), "UI missing navigation tab {nav_tab}");
+    }
+
+    // Verify DOC-PENDING-OWNER approval inbox, Dormant/Legacy triage controls, and Lock Plan beside Compare.
+    for expected in [
+        "DOC-PENDING-OWNER",
+        "Approval Inbox (DOC-PENDING-OWNER)",
+        "Dormant",
+        "Legacy",
+        "Needs Triage",
+        "Keep Dormant",
+        "Promote to Active",
+        "Archive Retired",
+        "/api/tools/set_lifecycle_tier",
+        "Lock Plan Version",
+        "id=\"lock-plan-btn\"",
+        "id=\"compare-plan-btn\"",
+        "Compare",
+        "History &amp; Restore",
+        "Source Passport",
+        "optional-modules-details",
+    ] {
+        assert!(html.contains(expected), "UI missing interactive fragment {expected}");
+    }
+
+    // Verify budget optional module is unchecked by default.
+    let budget_line = html
+        .lines()
+        .find(|line| line.contains("value=\"budget\""))
+        .expect("budget checkbox line");
+    assert!(
+        !budget_line.contains("checked"),
+        "budget module checkbox must not be checked by default"
+    );
+
+    // Verify zero external CDN script/link leaks and zero em/en dashes.
+    assert!(!html.contains("http://"), "UI must not reference http:// URLs");
+    assert!(!html.contains("https://"), "UI must not reference https:// CDN URLs");
+    assert!(!html.contains('\u{2014}'), "UI must not contain em dash");
+    assert!(!html.contains('\u{2013}'), "UI must not contain en dash");
 }

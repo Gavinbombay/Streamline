@@ -1,18 +1,23 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use streamline_conveyor::{
+    append_trajectory_jsonl, execute_conveyor_blocking, ConveyorError, DispatchOutcome,
+    DispatchRequest, TrajectoryExportInput,
+};
 use streamline_core::{
     assess_work_with_modules, check_sync, AssessmentInput, DivergenceStatus, FreshnessState,
-    LifecycleTier, SourcePassport, TriageState, WorkKind,
+    LifecycleTier, PrincipalRole, SourcePassport, TriageState, WorkKind,
 };
 use streamline_safe::inspect_text;
 use streamline_store::{
     compare_texts, AccessGrant, CreateTrioProjectRequest, OwnDecisionInput,
     RecordDivergenceRequest, RecordLessonRequest, RequirementRowInput, ResourceFilter,
-    SaveResourceRequest, SaveSyncReportRequest, UpdateRequirementStageRequest,
+    SaveResourceRequest, SaveSyncReportRequest, StoreError, TrioProjectBundle,
+    UpdateRequirementStageRequest,
 };
 
 use crate::error::ApiError;
@@ -41,7 +46,7 @@ pub struct ReadyStatus {
     pub current_rules_sha256: String,
 }
 
-pub const KNOWN_TOOLS: [&str; 38] = [
+pub const KNOWN_TOOLS: [&str; 42] = [
     "ready",
     "bootstrap",
     "ack_rules",
@@ -72,12 +77,16 @@ pub const KNOWN_TOOLS: [&str; 38] = [
     "check_sync",
     "save_sync_report",
     "get_sync_report",
+    "dispatch_run",
+    "get_run_status",
+    "list_conveyor_runs",
     "mark_project_cleanup_verified",
     "record_lesson",
     "record_no_new_lessons",
     "query_lessons",
     "submit_how_it_works",
     "approve_release",
+    "export_trajectory",
     "sync_vault",
     "export_workspace",
 ];
@@ -99,7 +108,7 @@ pub fn compute_ready_status(state: &AppState) -> Result<ReadyStatus, ApiError> {
     })
 }
 
-/// Returns MCP `tools/list` metadata and JSON Schemas for all 38 tools.
+/// Returns MCP `tools/list` metadata and JSON Schemas for all 42 tools.
 pub fn tools_list() -> Vec<McpToolDescriptor> {
     vec![
         McpToolDescriptor {
@@ -479,6 +488,43 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
             }),
         },
         McpToolDescriptor {
+            name: "dispatch_run",
+            description: "Stage inputs and execute a hands-off conveyor build (plus cross-family accept for R2+) on configured harnesses.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" },
+                    "input_paths": { "type": "array", "items": { "type": "string" } },
+                    "preferred_builder_harness": { "type": "string" },
+                    "preferred_acceptor_harness": { "type": "string" },
+                    "risk_band": { "type": "integer", "minimum": 0, "maximum": 4 }
+                },
+                "required": ["project_id"]
+            }),
+        },
+        McpToolDescriptor {
+            name: "get_run_status",
+            description: "Return phase, manifests, cleanup/scan booleans, and state for a conveyor run.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" }
+                },
+                "required": ["run_id"]
+            }),
+        },
+        McpToolDescriptor {
+            name: "list_conveyor_runs",
+            description: "List recorded conveyor build and acceptance runs for a Trio+ project.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" }
+                },
+                "required": ["project_id"]
+            }),
+        },
+        McpToolDescriptor {
             name: "mark_project_cleanup_verified",
             description: "Part 1 of closeout gate: record verified cleanup of temporary, build, and scratch files for a project.",
             input_schema: json!({
@@ -548,6 +594,17 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
         McpToolDescriptor {
             name: "approve_release",
             description: "Owner-only release approval: transitions DOC_PENDING_OWNER -> DONE and promotes A rows to L.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" }
+                },
+                "required": ["project_id"]
+            }),
+        },
+        McpToolDescriptor {
+            name: "export_trajectory",
+            description: "Owner-only action: append a redacted JSONL trajectory summary for a Trio+ project to trajectories.jsonl.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1094,6 +1151,31 @@ pub fn dispatch_tool(
             )?;
             Ok(serde_json::to_value(report)?)
         }
+        "dispatch_run" => {
+            let active_grant = require_grant(grant)?;
+            let args: DispatchRunArgs = parse_args(raw_args)?;
+            handle_dispatch_run(state, active_grant, args)
+        }
+        "get_run_status" => {
+            let active_grant = require_grant(grant)?;
+            let args: RunIdArgs = parse_args(raw_args)?;
+            check_safe_segment("run_id", &args.run_id)?;
+            let run = state.store.get_conveyor_run(&args.run_id)?;
+            let _bundle = state
+                .store
+                .get_project_bundle(&active_grant.grant_id, &run.project_id)?;
+            Ok(serde_json::to_value(run)?)
+        }
+        "list_conveyor_runs" => {
+            let active_grant = require_grant(grant)?;
+            let args: ProjectIdArgs = parse_args(raw_args)?;
+            check_safe_segment("project_id", &args.project_id)?;
+            let _bundle = state
+                .store
+                .get_project_bundle(&active_grant.grant_id, &args.project_id)?;
+            let runs = state.store.list_conveyor_runs(&args.project_id)?;
+            Ok(serde_json::to_value(runs)?)
+        }
         "mark_project_cleanup_verified" => {
             let active_grant = require_grant(grant)?;
             let args: MarkCleanupArgs = parse_args(raw_args)?;
@@ -1198,7 +1280,23 @@ pub fn dispatch_tool(
                     tracing::warn!(error = %err, "best-effort vault sync after approve_release skipped");
                 }
             }
+            let runs_dir = state.config.runs_dir.trim();
+            if !runs_dir.is_empty() {
+                if let Err(err) = export_bundle_trajectory(
+                    state,
+                    &active_grant.grant_id,
+                    &bundle,
+                    Path::new(runs_dir),
+                ) {
+                    tracing::warn!(error = %err.message, "best-effort trajectory export after approve_release skipped");
+                }
+            }
             Ok(serde_json::to_value(bundle)?)
+        }
+        "export_trajectory" => {
+            let active_grant = require_grant(grant)?;
+            let args: ProjectIdArgs = parse_args(raw_args)?;
+            handle_export_trajectory(state, active_grant, args)
         }
         "sync_vault" => {
             let active_grant = require_grant(grant)?;
@@ -1503,6 +1601,155 @@ fn handle_export_workspace(
     }))
 }
 
+fn map_conveyor_error(err: ConveyorError) -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "CONVEYOR_ERROR",
+        err.to_string(),
+    )
+}
+
+fn handle_dispatch_run(
+    state: &AppState,
+    active_grant: &AccessGrant,
+    args: DispatchRunArgs,
+) -> Result<Value, ApiError> {
+    check_safe_segment("project_id", &args.project_id)?;
+    check_optional_safe_segment(
+        "preferred_builder_harness",
+        args.preferred_builder_harness.as_deref(),
+    )?;
+    check_optional_safe_segment(
+        "preferred_acceptor_harness",
+        args.preferred_acceptor_harness.as_deref(),
+    )?;
+    for path_item in &args.input_paths {
+        check_safe_text("input_paths", path_item, &state.redaction_policy)?;
+    }
+
+    let checked_grant = state.store.require_rules_acked(&active_grant.grant_id)?;
+    if !checked_grant.can_dispatch {
+        return Err(ApiError::from(StoreError::ForbiddenDispatch));
+    }
+
+    let bundle = state
+        .store
+        .get_project_bundle(&checked_grant.grant_id, &args.project_id)?;
+    let risk_band = args.risk_band.unwrap_or(bundle.project.risk);
+
+    let req = DispatchRequest {
+        project_id: args.project_id,
+        input_paths: args.input_paths.into_iter().map(PathBuf::from).collect(),
+        preferred_builder_harness: args.preferred_builder_harness,
+        preferred_acceptor_harness: args.preferred_acceptor_harness,
+        risk_band,
+    };
+    let outcome: DispatchOutcome =
+        execute_conveyor_blocking(&state.config, &req).map_err(map_conveyor_error)?;
+
+    state
+        .store
+        .upsert_conveyor_run(outcome.build_run.clone())?;
+    if let Some(ref accept_run) = outcome.accept_run {
+        state.store.upsert_conveyor_run(accept_run.clone())?;
+    }
+
+    Ok(serde_json::to_value(outcome)?)
+}
+
+fn export_bundle_trajectory(
+    state: &AppState,
+    grant_id: &str,
+    bundle: &TrioProjectBundle,
+    runs_dir: &Path,
+) -> Result<PathBuf, ApiError> {
+    let lessons =
+        state
+            .store
+            .query_lessons(grant_id, None, Some(&bundle.project.project_id), 50)?;
+    let own_statements = bundle
+        .own_decisions
+        .iter()
+        .map(|item| format!("{}: {}", item.own_id, item.statement))
+        .collect();
+    let div_summaries = bundle
+        .divergences
+        .iter()
+        .map(|item| {
+            format!(
+                "{} [{}]: {} -> {} ({})",
+                item.div_id, item.status, item.designed, item.observed, item.resolution
+            )
+        })
+        .collect();
+    let lesson_rules = lessons
+        .iter()
+        .map(|item| item.forward_rule.clone())
+        .collect();
+    let sync_verdict = bundle.sync_reports.first().map(|report| report.verdict);
+    let how_it_works_sha256 = bundle
+        .project
+        .how_it_works_resource_id
+        .as_ref()
+        .and_then(|res_id| bundle.resources.iter().find(|res| &res.id == res_id))
+        .or_else(|| {
+            bundle
+                .resources
+                .iter()
+                .find(|res| res.trio_role.as_deref() == Some("how_it_works"))
+        })
+        .map(|res| res.current_sha256.clone());
+
+    let input = TrajectoryExportInput {
+        project_id: bundle.project.project_id.clone(),
+        title: bundle.project.title.clone(),
+        profile: bundle.project.profile,
+        own_statements,
+        div_summaries,
+        lesson_rules,
+        sync_verdict,
+        how_it_works_sha256,
+    };
+
+    append_trajectory_jsonl(runs_dir, &state.redaction_policy, &input).map_err(map_conveyor_error)
+}
+
+fn handle_export_trajectory(
+    state: &AppState,
+    active_grant: &AccessGrant,
+    args: ProjectIdArgs,
+) -> Result<Value, ApiError> {
+    check_safe_segment("project_id", &args.project_id)?;
+    let checked_grant = state.store.require_rules_acked(&active_grant.grant_id)?;
+    let principal = state.store.get_principal(&checked_grant.principal_id)?;
+    if principal.role != PrincipalRole::Owner {
+        return Err(ApiError::from(StoreError::ForbiddenRole(
+            principal.role.to_string(),
+        )));
+    }
+    let runs_dir = state.config.runs_dir.trim();
+    if runs_dir.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "UNPROCESSABLE",
+            "runs_dir is not configured",
+        ));
+    }
+    let bundle = state
+        .store
+        .get_project_bundle(&checked_grant.grant_id, &args.project_id)?;
+    let trajectory_file = export_bundle_trajectory(
+        state,
+        &checked_grant.grant_id,
+        &bundle,
+        Path::new(runs_dir),
+    )?;
+    Ok(json!({
+        "project_id": args.project_id,
+        "trajectory_file": trajectory_file,
+    }))
+}
+
 #[derive(Deserialize)]
 struct AckRulesArgs {
     #[serde(alias = "sha256", alias = "digest")]
@@ -1762,4 +2009,19 @@ struct SubmitHowItWorksArgs {
 #[derive(Deserialize, Default)]
 struct ExportWorkspaceArgs {
     include_bodies: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct DispatchRunArgs {
+    project_id: String,
+    #[serde(default)]
+    input_paths: Vec<String>,
+    preferred_builder_harness: Option<String>,
+    preferred_acceptor_harness: Option<String>,
+    risk_band: Option<u8>,
+}
+
+#[derive(Deserialize)]
+struct RunIdArgs {
+    run_id: String,
 }

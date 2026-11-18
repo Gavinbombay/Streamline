@@ -1,0 +1,16 @@
+running 12 tests
+test tests::enforces_cross_family_on_r2_and_above ... ok
+test tests::missing_input_records_impasse_without_builder_strike ... ok
+test tests::same_family_rejected_upfront_for_r2_plus ... ok
+test tests::readonly_staging_blocks_rogue_builder_mutation ... ok
+test tests::two_strike_builder_failure_records_impasse_and_escalation ... ok
+test tests::dirty_work_dir_quarantines_run_before_acceptance ... ok
+test tests::redaction_hit_in_build_output_records_impasse_without_leaking ... ok
+test tests::full_conveyor_build_cleanup_scan_and_cross_family_accept_reaches_doc_pending ... ok
+test tests::trajectory_export_writes_verified_jsonl_and_blocks_unsafe_text ... ok
+test tests::scrubbed_environment_excludes_unrelated_parent_vars ... ok
+test tests::acceptor_nonzero_exit_records_impasse_and_escalation ... ok
+test tests::r2_preferred_same_family_acceptor_rejected_and_r1_allowed ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
