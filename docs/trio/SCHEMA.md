@@ -118,7 +118,7 @@ Failure/stop branches:
 
 ## 6. As-Built Ledger (`L14`)
 
-*Status at `0.1.0` (`DOC-PENDING-OWNER`): Slices 1, 2, and 3 implemented, tested (`43 passed, 0 failed`), and running live as `streamline.service` (`127.0.0.1:5880`) with `2,933` imported legacy records, `3` forward lessons in `lessons_learned`, and `2,937` synced vault markdown files.*
+*Status at `0.1.0` (`LIVE / CLOSED` for v0.1): Slices 1, 2, and 3 implemented, tested (`43 passed, 0 failed`), `HOW-IT-WORKS.md` approved by owner on `2026-11-18`, and running live as `streamline.service` (`127.0.0.1:5880`) with `2,933` imported legacy records, `3` forward lessons in `lessons_learned`, and synced vault markdown files.*
 
 | Component | Target Location | State | Evidence |
 | :--- | :--- | :--- | :--- |

@@ -51,6 +51,8 @@ Streamline listens to both human browsers and AI assistants at the same address:
 
 ## Step-by-Step Flow
 
+Every piece of work in Streamline moves through four clear stages from first connection to owner sign-off.
+
 ### 1. Starting a Session and Acknowledging Active Rules
 
 Every person or AI assistant connects using a **grant** (a permission pass created by the owner) and a **credential** (the secret pass phrase that proves who holds that grant). Streamline stores only a **SHA-256 hash / digest** (a one-way digital fingerprint) of the credential, never the raw phrase.
