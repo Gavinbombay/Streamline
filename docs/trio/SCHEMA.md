@@ -118,12 +118,12 @@ Failure/stop branches:
 
 ## 6. As-Built Ledger (`L14`)
 
-*Status at `0.1.0-d1`: Design baseline (`D`). Updated with verified file hashes, ports, and test counts as Slices 1 to 3 complete.*
+*Status at `0.1.0-s1`: Slice 1 implemented, unit/integration tested (`30 passed, 0 failed` at `26ba4990988a`), and verified end to end over live loopback HTTP/MCP (`127.0.0.1:15880`).*
 
 | Component | Target Location | State | Evidence |
 | :--- | :--- | :--- | :--- |
-| `streamline-core` | `crates/streamline-core` | `D` | `SCHEMA.md` §1, §3-5 |
-| `streamline-safe` | `crates/streamline-safe` | `D` | `SCHEMA.md` §1 |
-| `streamline-store` | `crates/streamline-store` | `D` | `SCHEMA.md` §3 |
-| `streamline-conveyor` | `crates/streamline-conveyor` | `D` | `SCHEMA.md` §5.3 |
-| `streamline-http` | `crates/streamline-http` | `D` | `SCHEMA.md` §4 |
+| `streamline-core` | `crates/streamline-core` | `A` | `7/7` unit tests + Clippy `0` warnings |
+| `streamline-safe` | `crates/streamline-safe` | `A` | `8/8` redaction/IP/segment tests + `422` live MCP block |
+| `streamline-store` | `crates/streamline-store` | `A` | `6/6` SQLite/vault/legacy/lessons tests + `2,933`-item legacy import e2e |
+| `streamline-conveyor` | `crates/streamline-conveyor` | `T` | Cross-family guard + manifest/cleanup helpers (`1/1` test; Slice 2 expands runner) |
+| `streamline-http` | `crates/streamline-http` | `A` | `8/8` HTTP/MCP/skills-zip/UI tests + live loopback MCP e2e |
