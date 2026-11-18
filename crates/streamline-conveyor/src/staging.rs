@@ -585,13 +585,7 @@ fn collect_files_pinned(
     let names = dir_fd
         .list_entry_names_bounded(remaining_entries)
         .map_err(|e| {
-            if e.kind() == io::ErrorKind::InvalidData {
-                ConveyorError::StageFailure(format!(
-                    "manifest directory entry count exceeds maximum of {MAX_MANIFEST_FILES}"
-                ))
-            } else {
-                ConveyorError::StageFailure(e.to_string())
-            }
+            ConveyorError::StageFailure(format!("manifest directory listing failed: {e}"))
         })?;
     acc.seen_entries = acc.seen_entries.saturating_add(names.len());
     for name in names {
@@ -804,18 +798,16 @@ fn check_banned(
             )));
         }
         *seen_entries += 1;
-        let Ok(entry) = entry else {
-            continue;
-        };
+        let entry = entry.map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
         let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| ConveyorError::StageFailure(e.to_string()))?;
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return Err(ConveyorError::DirtyScratch(
+                "scratch directory contains non-UTF-8 entry name".to_string(),
+            ));
         };
         if meta.file_type().is_dir() {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
             if banned.contains(&name) {
                 let rel = path
                     .strip_prefix(root)

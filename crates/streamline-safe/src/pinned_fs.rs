@@ -232,7 +232,10 @@ impl PinnedDir {
                 ));
             }
             let Ok(name_str) = c_name.to_str() else {
-                continue;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry name is not valid UTF-8",
+                ));
             };
             if names.len() >= max_entries {
                 return Err(io::Error::new(
@@ -1154,5 +1157,20 @@ mod tests {
             .list_entry_names_bounded(10)
             .expect("exact cap of 10 must succeed");
         assert_eq!(all.len(), 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_entry_names_rejects_non_utf8_entry_name() {
+        let tmp = TempDirGuard::new("pinned-fs-non-utf8");
+        let raw_bad = std::ffi::OsStr::from_bytes(b"bad_\xff_entry.txt");
+        std::fs::write(tmp.path.join(raw_bad), b"payload\n").expect("write non-utf8 file");
+
+        let dir = PinnedDir::open_existing_dir(&tmp.path).expect("open temp dir");
+        let err = dir
+            .list_entry_names()
+            .expect_err("non-UTF-8 filename must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("UTF-8"));
     }
 }

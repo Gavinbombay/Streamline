@@ -1318,3 +1318,72 @@ fn high_fanout_and_deep_output_trees_record_quota_impasse() {
         .expect("deep escalation present");
     assert!(deep_esc.contains("OUTPUT_QUOTA_EXCEEDED"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_output_filename_and_binary_prefixed_payload_blocked_before_accept() {
+    let tmp = TempDirGuard::new("conveyor-non-utf8-out");
+    let spec_path = tmp.path.join("spec.md");
+    fs::write(&spec_path, "Input\n").expect("write spec.md");
+
+    let non_utf8_builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        "python3 -c 'import os; p = os.fsencode(os.environ[\"STREAMLINE_OUT_DIR\"]) + b\"/\\xff_bad.txt\"; open(p, \"wb\").write(b\"ok\\n\")'",
+    );
+    let acceptor = sh_harness(
+        "agy-main",
+        "google-gemini",
+        "printf 'accepted\\n' > \"$STREAMLINE_OUT_DIR/verdict.txt\"",
+    );
+
+    let runs_dir = tmp.path.join("runs_non_utf8");
+    let cfg = base_config(&runs_dir, vec![non_utf8_builder, acceptor.clone()]);
+    let req = DispatchRequest {
+        project_id: "proj-non-utf8".to_string(),
+        input_paths: vec![spec_path.clone()],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+
+    let outcome = execute_conveyor_blocking(&cfg, &req).expect("non-utf8 output returns Impasse");
+    assert_eq!(outcome.final_state, RunState::Impasse);
+    assert!(!outcome.build_run.scan_clean);
+    assert!(outcome.accept_run.is_none());
+    let esc = outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("escalation present");
+    assert!(esc.contains("UTF-8"));
+
+    let bad_prefix = ["ghp_", "Demo123456AbCdEf"].concat();
+    let binary_stuffed_builder = sh_harness(
+        "codex-main",
+        "openai-codex",
+        &format!(
+            "python3 -c 'import os; p = os.path.join(os.environ[\"STREAMLINE_OUT_DIR\"], \"mixed.bin\"); open(p, \"wb\").write(b\"\\xff\\n{bad_prefix}\\n\")'"
+        ),
+    );
+    let runs_mixed = tmp.path.join("runs_mixed");
+    let cfg_mixed = base_config(&runs_mixed, vec![binary_stuffed_builder, acceptor]);
+    let req_mixed = DispatchRequest {
+        project_id: "proj-mixed-bytes".to_string(),
+        input_paths: vec![spec_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+    let mixed_outcome =
+        execute_conveyor_blocking(&cfg_mixed, &req_mixed).expect("mixed bytes returns Impasse");
+    assert_eq!(mixed_outcome.final_state, RunState::Impasse);
+    assert!(!mixed_outcome.build_run.scan_clean);
+    assert!(mixed_outcome.accept_run.is_none());
+    assert!(mixed_outcome
+        .escalation_markdown
+        .as_deref()
+        .unwrap_or_default()
+        .contains("REDACTION_SCAN_FAILED"));
+}

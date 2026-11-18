@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="855" height="632" viewBox="0 0 855 632">
+<svg xmlns="http://www.w3.org/2000/svg" width="855" height="652" viewBox="0 0 855 652">
   <defs>
     <style>
       .term-bg { fill: #0b1429; stroke: #3f577c; stroke-width: 1.5; rx: 10; }
@@ -11,14 +11,14 @@
       .highlight { fill: #94ead1; font-weight: 600; }
     </style>
   </defs>
-  <rect x="1" y="1" width="853" height="630" class="term-bg" />
+  <rect x="1" y="1" width="853" height="650" class="term-bg" />
   <path d="M 1,10 q 0,-9 9,-9 h 835 q 9,0 9,9 v 35 h -853 v -35" fill="#101a35" />
   <circle cx="24" cy="18" r="6" class="dot-red" />
   <circle cx="44" cy="18" r="6" class="dot-yellow" />
   <circle cx="64" cy="18" r="6" class="dot-green" />
   <text x="427.5" y="22" text-anchor="middle" class="title">streamline-terminal</text>
   <line x1="1" y1="36" x2="854" y2="36" stroke="#3f577c" stroke-width="1" />
-  <text x="24" y="68" class="code">running 23 tests</text>
+  <text x="24" y="68" class="code">running 24 tests</text>
   <text x="24" y="88" class="code highlight">test tests::acceptor_nonzero_exit_records_impasse_and_escalation ... ok</text>
   <text x="24" y="108" class="code highlight">test tests::compute_tree_manifest_enforces_file_count_limit ... ok</text>
   <text x="24" y="128" class="code highlight">test tests::dirty_work_dir_quarantines_run_before_acceptance ... ok</text>
@@ -28,21 +28,22 @@
   <text x="24" y="208" class="code highlight">test tests::input_path_outside_allowed_roots_is_blocked_at_impasse ... ok</text>
   <text x="24" y="228" class="code highlight">test tests::intermediate_symlink_under_allowed_root_is_rejected ... ok</text>
   <text x="24" y="248" class="code highlight">test tests::missing_input_records_impasse_without_builder_strike ... ok</text>
-  <text x="24" y="268" class="code highlight">test tests::oversized_harness_output_records_quota_impasse ... ok</text>
-  <text x="24" y="288" class="code highlight">test tests::project_scoped_dispatch_restricts_inputs_to_project_subdir ... ok</text>
-  <text x="24" y="308" class="code highlight">test tests::r2_preferred_same_family_acceptor_rejected_and_r1_allowed ... ok</text>
-  <text x="24" y="328" class="code highlight">test tests::readonly_staging_blocks_rogue_builder_mutation ... ok</text>
-  <text x="24" y="348" class="code highlight">test tests::redaction_hit_in_build_output_records_impasse_without_leaking ... ok</text>
-  <text x="24" y="368" class="code highlight">test tests::redaction_scan_caps_findings_at_max_scan_findings ... ok</text>
-  <text x="24" y="388" class="code highlight">test tests::same_family_rejected_upfront_for_r2_plus ... ok</text>
-  <text x="24" y="408" class="code highlight">test tests::scrubbed_environment_excludes_unrelated_parent_vars ... ok</text>
-  <text x="24" y="428" class="code highlight">test tests::symlink_input_path_is_rejected_without_copying ... ok</text>
-  <text x="24" y="448" class="code highlight">test tests::too_many_output_files_records_quota_impasse ... ok</text>
-  <text x="24" y="468" class="code highlight">test tests::trajectory_export_refuses_intermediate_symlinked_ancestor ... ok</text>
-  <text x="24" y="488" class="code highlight">test tests::trajectory_export_refuses_symlinked_target_and_runs_dir ... ok</text>
-  <text x="24" y="508" class="code highlight">test tests::trajectory_export_writes_verified_jsonl_and_blocks_unsafe_text ... ok</text>
-  <text x="24" y="528" class="code highlight">test tests::two_strike_builder_failure_records_impasse_and_escalation ... ok</text>
-  <text x="24" y="548" class="code highlight">test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s</text>
-  <text x="24" y="568" class="code">running 0 tests</text>
-  <text x="24" y="588" class="code highlight">test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s</text>
+  <text x="24" y="268" class="code highlight">test tests::non_utf8_output_filename_and_binary_prefixed_payload_blocked_before_accept ... ok</text>
+  <text x="24" y="288" class="code highlight">test tests::oversized_harness_output_records_quota_impasse ... ok</text>
+  <text x="24" y="308" class="code highlight">test tests::project_scoped_dispatch_restricts_inputs_to_project_subdir ... ok</text>
+  <text x="24" y="328" class="code highlight">test tests::r2_preferred_same_family_acceptor_rejected_and_r1_allowed ... ok</text>
+  <text x="24" y="348" class="code highlight">test tests::readonly_staging_blocks_rogue_builder_mutation ... ok</text>
+  <text x="24" y="368" class="code highlight">test tests::redaction_hit_in_build_output_records_impasse_without_leaking ... ok</text>
+  <text x="24" y="388" class="code highlight">test tests::redaction_scan_caps_findings_at_max_scan_findings ... ok</text>
+  <text x="24" y="408" class="code highlight">test tests::same_family_rejected_upfront_for_r2_plus ... ok</text>
+  <text x="24" y="428" class="code highlight">test tests::scrubbed_environment_excludes_unrelated_parent_vars ... ok</text>
+  <text x="24" y="448" class="code highlight">test tests::symlink_input_path_is_rejected_without_copying ... ok</text>
+  <text x="24" y="468" class="code highlight">test tests::too_many_output_files_records_quota_impasse ... ok</text>
+  <text x="24" y="488" class="code highlight">test tests::trajectory_export_refuses_intermediate_symlinked_ancestor ... ok</text>
+  <text x="24" y="508" class="code highlight">test tests::trajectory_export_refuses_symlinked_target_and_runs_dir ... ok</text>
+  <text x="24" y="528" class="code highlight">test tests::trajectory_export_writes_verified_jsonl_and_blocks_unsafe_text ... ok</text>
+  <text x="24" y="548" class="code highlight">test tests::two_strike_builder_failure_records_impasse_and_escalation ... ok</text>
+  <text x="24" y="568" class="code highlight">test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s</text>
+  <text x="24" y="588" class="code">running 0 tests</text>
+  <text x="24" y="608" class="code highlight">test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s</text>
 </svg>

@@ -1288,7 +1288,7 @@ fn scan_pinned_dir(
         Ok(names) => names,
         Err(err) if err.kind() == io::ErrorKind::InvalidData => {
             return Ok(Some(format!(
-                "output directory entry count exceeded maximum budget of {MAX_DIR_ENTRIES} entries"
+                "output directory listing rejected ({MAX_DIR_ENTRIES} entry cap): {err}"
             )));
         }
         Err(err) => return Err(ConveyorError::StageFailure(err.to_string())),
@@ -1336,20 +1336,19 @@ fn scan_pinned_dir(
                 state.total_bytes = state.total_bytes.saturating_add(bytes.len());
 
                 if state.findings.len() < MAX_SCAN_FINDINGS {
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        let report = inspect_text(text, policy);
-                        if !report.ok {
-                            for violation in report.violations {
-                                if state.findings.len() >= MAX_SCAN_FINDINGS {
-                                    break;
-                                }
-                                state.findings.push(OutputScanFinding {
-                                    rel_path: rel_path.clone(),
-                                    line: violation.line,
-                                    kind: violation.kind,
-                                    reason: violation.reason,
-                                });
+                    let text = String::from_utf8_lossy(&bytes);
+                    let report = inspect_text(&text, policy);
+                    if !report.ok {
+                        for violation in report.violations {
+                            if state.findings.len() >= MAX_SCAN_FINDINGS {
+                                break;
                             }
+                            state.findings.push(OutputScanFinding {
+                                rel_path: rel_path.clone(),
+                                line: violation.line,
+                                kind: violation.kind,
+                                reason: violation.reason,
+                            });
                         }
                     }
                 }
@@ -1390,7 +1389,8 @@ fn compute_output_manifest_sha256(
     match compute_tree_manifest(out_dir) {
         Ok(manifest) => Ok(manifest.manifest_sha256),
         Err(ConveyorError::StageFailure(msg))
-            if allow_quota_empty && msg.contains("exceeds maximum") =>
+            if allow_quota_empty
+                && (msg.contains("exceeds maximum") || msg.contains("not valid UTF-8")) =>
         {
             Ok(String::new())
         }
