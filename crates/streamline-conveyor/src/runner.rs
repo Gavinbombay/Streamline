@@ -955,13 +955,17 @@ fn record_input_rejection_impasse(
     rejected_path: &str,
     detail: &str,
 ) -> Result<DispatchOutcome, ConveyorError> {
+    let policy = RedactionPolicy {
+        public_safe_mode: ctx.config.public_safe_mode,
+    };
+    let safe_rejected_path = sanitize_escalation_path(rejected_path, &policy);
     let escalation = format!(
         "# Conveyor Escalation Report\n\n\
          - Reason: `{reason_code}`\n\
          - Project ID: `{}`\n\
          - Run ID: `{}`\n\
          - Harness: `{}` (`{}`)\n\
-         - {path_label}: `{rejected_path}`\n\n\
+         - {path_label}: `{safe_rejected_path}`\n\n\
          {detail}\n",
         ctx.req.project_id, ctx.build_run_id, ctx.builder.id, ctx.builder.family
     );
@@ -1301,6 +1305,26 @@ fn scan_pinned_dir(
         } else {
             format!("{prefix}/{name}")
         };
+        let safe_rel_path = sanitize_escalation_path(&rel_path, policy);
+        if state.findings.len() < MAX_SCAN_FINDINGS {
+            let name_report = inspect_text(&name, policy);
+            if !name_report.ok {
+                for violation in name_report.violations {
+                    if state.findings.len() >= MAX_SCAN_FINDINGS {
+                        break;
+                    }
+                    state.findings.push(OutputScanFinding {
+                        rel_path: safe_rel_path.clone(),
+                        line: 1,
+                        kind: violation.kind,
+                        reason: format!(
+                            "output entry name failed redaction check: {}",
+                            violation.reason
+                        ),
+                    });
+                }
+            }
+        }
         match dir_fd.is_regular_file_nofollow(&name) {
             Ok(true) => {
                 if state.seen_files >= MAX_OUTPUT_FILES {
@@ -1322,11 +1346,11 @@ fn scan_pinned_dir(
                     {
                         let reason = if remaining < MAX_SINGLE_OUTPUT_BYTES {
                             format!(
-                                "total output bytes exceeded maximum budget of {MAX_TOTAL_OUTPUT_BYTES} bytes at '{rel_path}'"
+                                "total output bytes exceeded maximum budget of {MAX_TOTAL_OUTPUT_BYTES} bytes at '{safe_rel_path}'"
                             )
                         } else {
                             format!(
-                                "output file '{rel_path}' exceeded single-file budget of {MAX_SINGLE_OUTPUT_BYTES} bytes"
+                                "output file '{safe_rel_path}' exceeded single-file budget of {MAX_SINGLE_OUTPUT_BYTES} bytes"
                             )
                         };
                         return Ok(Some(reason));
@@ -1344,7 +1368,7 @@ fn scan_pinned_dir(
                                 break;
                             }
                             state.findings.push(OutputScanFinding {
-                                rel_path: rel_path.clone(),
+                                rel_path: safe_rel_path.clone(),
                                 line: violation.line,
                                 kind: violation.kind,
                                 reason: violation.reason,
@@ -1484,6 +1508,23 @@ fn format_quota_escalation(
          max single file: {MAX_SINGLE_OUTPUT_BYTES} bytes, max total: {MAX_TOTAL_OUTPUT_BYTES} bytes). \
          Escalated to impasse.\n"
     )
+}
+
+fn sanitize_escalation_path(raw_path: &str, policy: &RedactionPolicy) -> String {
+    let strict_policy = RedactionPolicy {
+        public_safe_mode: true,
+    };
+    let chars_ok = !raw_path.is_empty()
+        && raw_path.len() <= 128
+        && raw_path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'));
+    if chars_ok && inspect_text(raw_path, policy).ok && inspect_text(raw_path, &strict_policy).ok {
+        raw_path.to_string()
+    } else {
+        let digest = streamline_safe::sha256_hex(raw_path.as_bytes());
+        format!("redacted-path-{}", &digest[..12])
+    }
 }
 
 fn format_redaction_escalation(

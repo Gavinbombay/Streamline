@@ -474,7 +474,10 @@ fn redaction_hit_in_build_output_records_impasse_without_leaking() {
     fs::write(&spec_path, "Input\n").expect("write spec.md");
 
     let leaked_sample = ["ghp_", "AbCdEf123456GhIj"].concat();
-    let script = format!("printf '%s\\n' '{leaked_sample}' > \"$STREAMLINE_OUT_DIR/report.txt\"");
+    let script = format!(
+        "printf '%s\\n' '{leaked_sample}' > \"$STREAMLINE_OUT_DIR/report.txt\"
+         printf '%s\\n' '{leaked_sample}' > \"$STREAMLINE_OUT_DIR/{leaked_sample}.txt\""
+    );
     let builder = sh_harness("codex-main", "openai-codex", &script);
     let acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
 
@@ -499,8 +502,38 @@ fn redaction_hit_in_build_output_records_impasse_without_leaking() {
         .as_ref()
         .expect("escalation markdown present");
     assert!(escalation.contains("CredentialPrefix"));
-    assert!(escalation.contains("line 1"));
+    assert!(escalation.contains("report.txt"));
+    assert!(escalation.contains("redacted-path-"));
     assert!(!escalation.contains(&leaked_sample));
+
+    // Also verify clean file content under a sensitive filename is caught and redacted in ESCALATION.md.
+    let name_only_script =
+        format!("printf 'clean\\n' > \"$STREAMLINE_OUT_DIR/{leaked_sample}_clean.txt\"");
+    let name_builder = sh_harness("codex-main", "openai-codex", &name_only_script);
+    let name_acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
+    let runs_name_dir = tmp.path.join("runs_name_only");
+    let spec_path_2 = tmp.path.join("spec2.md");
+    fs::write(&spec_path_2, "Input\n").expect("write spec2.md");
+    let cfg_name = base_config(&runs_name_dir, vec![name_builder, name_acceptor]);
+    let req_name = DispatchRequest {
+        project_id: "proj-scan-name".to_string(),
+        input_paths: vec![spec_path_2],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+    let name_outcome =
+        execute_conveyor_blocking(&cfg_name, &req_name).expect("execute filename scan hit");
+    assert_eq!(name_outcome.final_state, RunState::Impasse);
+    assert!(!name_outcome.build_run.scan_clean);
+    assert!(name_outcome.accept_run.is_none());
+    let name_esc = name_outcome
+        .escalation_markdown
+        .as_ref()
+        .expect("filename escalation present");
+    assert!(name_esc.contains("redacted-path-"));
+    assert!(!name_esc.contains(&leaked_sample));
 }
 
 #[test]
