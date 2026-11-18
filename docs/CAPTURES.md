@@ -17,7 +17,7 @@ Every terminal capture in `docs/captures/` is generated from real loopback test 
 - **Command**: `cargo test --locked -p streamline-conveyor` (filtered to `running`, `test `, and `test result:` lines)
 - **Plain-text transcript**: [`docs/captures/conveyor-closeout.txt`](captures/conveyor-closeout.txt)
 - **Rendered SVG**: [`docs/captures/conveyor-closeout.svg`](captures/conveyor-closeout.svg)
-- **Text SHA-256**: `389d843793d01b26fc6ad238c730ad7ae706018b0b48f1c12cb58f6a7d90225d`
+- **Text SHA-256**: `db824ef141a832c08eb09f303a11430674c2f39d99e164ec4038728e2f48f4da`
 - **Scope**: Verifies cross-family acceptor enforcement (`R2` and above), read-only staging manifests, two-strike builder impasse escalation, dirty work-tree quarantine, scrubbed environment execution, redaction impasse protection, stray-artifact cleanup checks, and verified JSONL trajectory export.
 
 ## Regenerating Captures

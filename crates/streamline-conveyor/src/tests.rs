@@ -1441,3 +1441,57 @@ fn oversized_staged_input_redacts_sensitive_entry_name_in_error() {
     assert!(msg.contains("redacted-path-"));
     assert!(!msg.contains("StageLeak123456AbCd"));
 }
+
+#[test]
+fn harness_discards_large_stdio_enforces_timeout_and_concurrency_cap() {
+    use std::time::Duration;
+
+    let tmp = TempDirGuard::new("conveyor-stdio-timeout-cap");
+    let spec_path = tmp.path.join("spec.md");
+    fs::write(&spec_path, "Input\n").expect("write spec.md");
+
+    let noisy_builder = sh_harness(
+        "codex-noisy",
+        "openai-codex",
+        "dd if=/dev/zero bs=1048576 count=8 2>/dev/null
+         dd if=/dev/zero bs=1048576 count=8 >&2 2>/dev/null || true
+         printf 'ok\\n' > \"$STREAMLINE_OUT_DIR/done.txt\"",
+    );
+    let acceptor = sh_harness("agy-main", "google-gemini", "exit 0");
+    let runs_dir = tmp.path.join("runs");
+    let cfg = base_config(&runs_dir, vec![noisy_builder, acceptor]);
+    let req = DispatchRequest {
+        project_id: "proj-noisy-stdio".to_string(),
+        input_paths: vec![spec_path],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+    let outcome = execute_conveyor_blocking(&cfg, &req).expect("noisy stdio run succeeds");
+    assert_eq!(outcome.final_state, RunState::DocPendingOwner);
+
+    let slow_harness = sh_harness("codex-slow", "openai-codex", "sleep 5");
+    let work_dir = tmp.path.join("slow_work");
+    fs::create_dir_all(&work_dir).expect("create slow_work");
+    let timed = crate::runner::run_harness_command_with_timeout(
+        &runs_dir.to_string_lossy(),
+        &slow_harness,
+        &work_dir,
+        &[],
+        Duration::from_millis(60),
+    )
+    .expect("timeout returns HarnessExit::TimedOut");
+    assert!(!timed.is_success());
+    assert!(matches!(timed, crate::runner::HarnessExit::TimedOut(_)));
+
+    let capped = sh_harness("codex-cap", "openai-codex", "exit 0");
+    let slot_one =
+        crate::runner::acquire_harness_slot(&runs_dir.to_string_lossy(), &capped).expect("slot 1");
+    let slot_two = crate::runner::acquire_harness_slot(&runs_dir.to_string_lossy(), &capped);
+    assert!(matches!(slot_two, Err(ConveyorError::RunnerFailure(_))));
+    drop(slot_one);
+    let slot_three =
+        crate::runner::acquire_harness_slot(&runs_dir.to_string_lossy(), &capped).expect("slot 3");
+    drop(slot_three);
+}

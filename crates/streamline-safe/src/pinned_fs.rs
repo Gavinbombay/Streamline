@@ -17,6 +17,18 @@ const MAX_TEXT_READ_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_DIR_ENTRIES: usize = 16_384;
 pub const MAX_ENTRY_NAME_BYTES: usize = 255;
 
+/// Sends `SIGKILL` to Unix process group `-pgid` when `pgid > 1`, reaping
+/// orphaned background children spawned inside an isolated harness group.
+pub fn kill_process_group(pgid: u32) {
+    if let Ok(raw) = i32::try_from(pgid) {
+        if raw > 1 {
+            unsafe {
+                let _ = libc::kill(-raw, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 /// A pinned directory handle that executes child lookups, reads, and atomic
 /// writes relative to an open directory file descriptor on Unix.
 #[derive(Debug)]

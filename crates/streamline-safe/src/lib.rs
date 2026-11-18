@@ -5,7 +5,7 @@
 
 pub mod pinned_fs;
 
-pub use pinned_fs::PinnedDir;
+pub use pinned_fs::{kill_process_group, PinnedDir};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};

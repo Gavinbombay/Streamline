@@ -1,13 +1,20 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use streamline_core::{ConveyorRun, HarnessSpec, RunPhase, RunState, StreamlineConfig};
-use streamline_safe::{inspect_text, PinnedDir, RedactionPolicy, ViolationKind};
+use streamline_safe::{
+    inspect_text, kill_process_group, PinnedDir, RedactionPolicy, ViolationKind,
+};
 
 use crate::error::ConveyorError;
 use crate::staging::{
@@ -23,6 +30,76 @@ pub const MAX_TREE_DEPTH: usize = 32;
 pub const MAX_SINGLE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOTAL_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCAN_FINDINGS: usize = 64;
+pub const MAX_HARNESS_RUNTIME: Duration = Duration::from_secs(300);
+pub const MAX_CONCURRENT_DISPATCHES: usize = 32;
+
+static ACTIVE_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+static HARNESS_ACTIVE_SLOTS: LazyLock<Mutex<HashMap<(String, String), usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) struct HarnessSlotGuard {
+    slot_pair: (String, String),
+}
+
+impl Drop for HarnessSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = HARNESS_ACTIVE_SLOTS.lock() {
+            if let Some(count) = map.get_mut(&self.slot_pair) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&self.slot_pair);
+                }
+            }
+        }
+        ACTIVE_DISPATCHES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn acquire_harness_slot(
+    runs_root: &str,
+    harness: &HarnessSpec,
+) -> Result<HarnessSlotGuard, ConveyorError> {
+    let prev = ACTIVE_DISPATCHES.fetch_add(1, Ordering::SeqCst);
+    if prev >= MAX_CONCURRENT_DISPATCHES {
+        ACTIVE_DISPATCHES.fetch_sub(1, Ordering::SeqCst);
+        return Err(ConveyorError::RunnerFailure(format!(
+            "conveyor global concurrency limit ({MAX_CONCURRENT_DISPATCHES}) reached"
+        )));
+    }
+
+    let cap = (harness.max_concurrency.max(1) as usize).min(MAX_CONCURRENT_DISPATCHES);
+    let slot_pair = (runs_root.to_string(), harness.id.clone());
+    let mut map = match HARNESS_ACTIVE_SLOTS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let current = map.get(&slot_pair).copied().unwrap_or(0);
+    if current >= cap {
+        drop(map);
+        ACTIVE_DISPATCHES.fetch_sub(1, Ordering::SeqCst);
+        return Err(ConveyorError::RunnerFailure(format!(
+            "harness '{}' max_concurrency ({cap}) reached",
+            harness.id
+        )));
+    }
+    map.insert(slot_pair.clone(), current + 1);
+    Ok(HarnessSlotGuard { slot_pair })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HarnessExit {
+    Exited(ExitStatus),
+    TimedOut(Duration),
+}
+
+impl HarnessExit {
+    pub(crate) fn is_success(self) -> bool {
+        match self {
+            Self::Exited(status) => status.success(),
+            Self::TimedOut(_) => false,
+        }
+    }
+}
 
 /// Request parameters for a blocking hands-off conveyor dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,16 +361,26 @@ fn execute_conveyor_inner(ctx: &RunContext<'_>) -> Result<DispatchOutcome, Conve
         ("STREAMLINE_OUT_DIR", ctx.out_dir.as_os_str()),
     ];
 
-    let status1 = run_harness_command(ctx.builder, &ctx.work_dir, &build_env)?;
-    if !status1.success() {
+    let status1 = run_harness_command(
+        ctx.config.runs_dir.trim(),
+        ctx.builder,
+        &ctx.work_dir,
+        &build_env,
+    )?;
+    if !status1.is_success() {
         tracing::warn!(
             run_id = %ctx.build_run_id,
             harness_id = %ctx.builder.id,
-            status = %format_exit_status(status1),
+            status = %format_harness_exit(status1),
             "builder attempt 1 exited nonzero; retrying once"
         );
-        let status2 = run_harness_command(ctx.builder, &ctx.work_dir, &build_env)?;
-        if !status2.success() {
+        let status2 = run_harness_command(
+            ctx.config.runs_dir.trim(),
+            ctx.builder,
+            &ctx.work_dir,
+            &build_env,
+        )?;
+        if !status2.is_success() {
             return record_two_strike_impasse(
                 ctx,
                 &staged_manifest.manifest_sha256,
@@ -996,8 +1083,8 @@ fn record_input_rejection_impasse(
 fn record_two_strike_impasse(
     ctx: &RunContext<'_>,
     input_manifest_sha256: &str,
-    status1: ExitStatus,
-    status2: ExitStatus,
+    status1: HarnessExit,
+    status2: HarnessExit,
 ) -> Result<DispatchOutcome, ConveyorError> {
     let escalation = format!(
         "# Conveyor Escalation Report\n\n\
@@ -1013,8 +1100,8 @@ fn record_two_strike_impasse(
         ctx.build_run_id,
         ctx.builder.id,
         ctx.builder.family,
-        format_exit_status(status1),
-        format_exit_status(status2),
+        format_harness_exit(status1),
+        format_harness_exit(status2),
     );
     write_escalation_file(&ctx.out_dir, &escalation)?;
     let out_manifest = compute_tree_manifest(&ctx.out_dir)?;
@@ -1071,8 +1158,13 @@ fn run_acceptance_pass(
         ("STREAMLINE_OUT_DIR", out_accept_dir.as_os_str()),
     ];
 
-    let accept_status = run_harness_command(acceptor, &work_accept_dir, &accept_env)?;
-    if !accept_status.success() {
+    let accept_status = run_harness_command(
+        ctx.config.runs_dir.trim(),
+        acceptor,
+        &work_accept_dir,
+        &accept_env,
+    )?;
+    if !accept_status.is_success() {
         let escalation = format!(
             "# Conveyor Escalation Report\n\n\
              - Reason: `ACCEPTOR_REJECTED`\n\
@@ -1087,7 +1179,7 @@ fn run_acceptance_pass(
             accept_run_id,
             acceptor.id,
             acceptor.family,
-            format_exit_status(accept_status),
+            format_harness_exit(accept_status),
         );
         write_escalation_file(&out_accept_dir, &escalation)?;
         let cleanup_clean = verify_cleanup_clean(&work_accept_dir).is_ok();
@@ -1221,15 +1313,31 @@ fn run_acceptance_pass(
 }
 
 fn run_harness_command(
+    runs_root: &str,
     harness: &HarnessSpec,
     cwd: &Path,
     extra_env: &[(&str, &OsStr)],
-) -> Result<ExitStatus, ConveyorError> {
+) -> Result<HarnessExit, ConveyorError> {
+    run_harness_command_with_timeout(runs_root, harness, cwd, extra_env, MAX_HARNESS_RUNTIME)
+}
+
+pub(crate) fn run_harness_command_with_timeout(
+    runs_root: &str,
+    harness: &HarnessSpec,
+    cwd: &Path,
+    extra_env: &[(&str, &OsStr)],
+    timeout: Duration,
+) -> Result<HarnessExit, ConveyorError> {
+    let _slot_guard = acquire_harness_slot(runs_root, harness)?;
+
     let mut cmd = Command::new(&harness.command[0]);
     if harness.command.len() > 1 {
         cmd.args(&harness.command[1..]);
     }
     cmd.current_dir(cwd);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
     cmd.env_clear();
     for var_name in SAFE_ENV_VARS {
         if let Some(val) = std::env::var_os(var_name) {
@@ -1239,11 +1347,40 @@ fn run_harness_command(
     for (var_name, val) in extra_env {
         cmd.env(var_name, val);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
-    let output = cmd.output().map_err(|err| {
+    let mut child = cmd.spawn().map_err(|err| {
         ConveyorError::RunnerFailure(format!("failed to spawn harness '{}': {err}", harness.id))
     })?;
-    Ok(output.status)
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(HarnessExit::Exited(status)),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_group(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(HarnessExit::TimedOut(timeout));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ConveyorError::RunnerFailure(format!(
+                    "failed waiting on harness '{}': {err}",
+                    harness.id
+                )));
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1558,6 +1695,15 @@ fn format_redaction_escalation(
         ));
     }
     md
+}
+
+fn format_harness_exit(exit: HarnessExit) -> String {
+    match exit {
+        HarnessExit::Exited(status) => format_exit_status(status),
+        HarnessExit::TimedOut(limit) => {
+            format!("timed out after {} ms", limit.as_millis())
+        }
+    }
 }
 
 fn format_exit_status(status: ExitStatus) -> String {
