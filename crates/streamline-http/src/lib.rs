@@ -79,7 +79,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(ready_handler))
         .route("/mcp", post(mcp_http_handler))
         .route("/api/tools/:tool_name", post(rest_tool_handler))
-        .route("/downloads/streamline-skills.zip", get(skills_zip_handler));
+        .route("/downloads/streamline-skills.zip", get(skills_zip_handler))
+        .route("/_streamline/assets/fonts/:name", get(static_font_handler))
+        .route(
+            "/_streamline/assets/artwork/:name",
+            get(static_artwork_handler),
+        )
+        .route("/_streamline/assets/mark.svg", get(static_mark_handler));
 
     if let Some(plugin_dir) = state.config.presence_plugin_path() {
         if is_verified_real_dir(plugin_dir) {
@@ -247,4 +253,55 @@ async fn skills_zip_handler(State(state): State<AppState>) -> Response {
         bytes,
     )
         .into_response()
+}
+
+const FONT_BRICOLAGE_LATIN: &[u8] =
+    include_bytes!("../assets/fonts/bricolage-grotesque-latin.woff2");
+const FONT_BRICOLAGE_LATIN_EXT: &[u8] =
+    include_bytes!("../assets/fonts/bricolage-grotesque-latin-ext.woff2");
+const FONT_INTER_LATIN: &[u8] = include_bytes!("../assets/fonts/inter-latin.woff2");
+const FONT_INTER_LATIN_EXT: &[u8] = include_bytes!("../assets/fonts/inter-latin-ext.woff2");
+
+const ARTWORK_GRAIN: &[u8] = include_bytes!("../assets/artwork/streamline-grain.svg");
+const ARTWORK_NEBULA: &[u8] = include_bytes!("../assets/artwork/streamline-nebula.svg");
+const ARTWORK_STREAKS: &[u8] = include_bytes!("../assets/artwork/streamline-streaks.svg");
+const ARTWORK_MARK: &[u8] = include_bytes!("../assets/artwork/mark.svg");
+
+fn static_asset_response(content_type: &'static str, bytes: &'static [u8]) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn static_font_handler(Path(name): Path<String>) -> Response {
+    let bytes = match name.as_str() {
+        "bricolage-grotesque-latin.woff2" => FONT_BRICOLAGE_LATIN,
+        "bricolage-grotesque-latin-ext.woff2" => FONT_BRICOLAGE_LATIN_EXT,
+        "inter-latin.woff2" => FONT_INTER_LATIN,
+        "inter-latin-ext.woff2" => FONT_INTER_LATIN_EXT,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    static_asset_response("font/woff2", bytes)
+}
+
+async fn static_artwork_handler(Path(name): Path<String>) -> Response {
+    let bytes = match name.as_str() {
+        "streamline-grain.svg" => ARTWORK_GRAIN,
+        "streamline-nebula.svg" => ARTWORK_NEBULA,
+        "streamline-streaks.svg" => ARTWORK_STREAKS,
+        "mark.svg" => ARTWORK_MARK,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    static_asset_response("image/svg+xml", bytes)
+}
+
+async fn static_mark_handler() -> Response {
+    static_asset_response("image/svg+xml", ARTWORK_MARK)
 }

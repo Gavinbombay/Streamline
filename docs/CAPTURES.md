@@ -9,15 +9,15 @@ Every terminal capture in `docs/captures/` is generated from real loopback test 
 - **Command**: `cargo test --locked -p streamline-http` (filtered to `running`, `test `, and `test result:` lines)
 - **Plain-text transcript**: [`docs/captures/mcp-policy.txt`](captures/mcp-policy.txt)
 - **Rendered SVG**: [`docs/captures/mcp-policy.svg`](captures/mcp-policy.svg)
-- **Text SHA-256**: `b6dd80edb6b68467cc5557f2fb10f4b8d29788a65c2ad3d48a7e24d036672a4c`
-- **Scope**: Verifies `/ready`, `/downloads/streamline-skills.zip`, 3-pane Web UI rendering, MCP initialization and tool discovery, tag isolation, stdio MCP notifications, redaction blocking (`422 REDACTION_BLOCKED`), rule acknowledgement (`412 RULES_ACK_REQUIRED` -> `ack_rules`), the 3-part closeout gate, and conveyor trajectory export.
+- **Text SHA-256**: `69746a169c51b522d7ea99fcdd1472855f330891fc9ff5703c12b06414c9b026`
+- **Scope**: Verifies `/ready`, `/downloads/streamline-skills.zip`, Streamline workspace UI rendering (`Home`, `My profile`, `Projects`, `Library`, `Lessons`, `Connected apps`, `Settings`), embedded OFL fonts and SVG artwork (`/_streamline/assets/*`), `44`-tool MCP initialization and tool discovery, tag isolation, stdio MCP notifications, redaction blocking (`422 REDACTION_BLOCKED`), rule acknowledgement (`412 RULES_ACK_REQUIRED` -> `ack_rules`), the `HOW-IT-WORKS` closeout gate, the GitHub release `AUDIT_PENDING` / `record_security_audit` gate, and conveyor trajectory export.
 
 ### 2. Trio+ Conveyor Closeout Gate (`conveyor-closeout`)
 
 - **Command**: `cargo test --locked -p streamline-conveyor` (filtered to `running`, `test `, and `test result:` lines)
 - **Plain-text transcript**: [`docs/captures/conveyor-closeout.txt`](captures/conveyor-closeout.txt)
 - **Rendered SVG**: [`docs/captures/conveyor-closeout.svg`](captures/conveyor-closeout.svg)
-- **Text SHA-256**: `78b2293e8660e9527cc7a8d6216efaec8245b66143bf4bf9757e77707bdb5ef2`
+- **Text SHA-256**: `0dc453ebe806835f657279781ea5ee24b7f119f6dd25d814ed6da655673b5cf3`
 - **Scope**: Verifies cross-family acceptor enforcement (`R2` and above), read-only staging manifests, two-strike builder impasse escalation, dirty work-tree quarantine, scrubbed environment execution, redaction impasse protection, stray-artifact cleanup checks, and verified JSONL trajectory export.
 
 ## Regenerating Captures

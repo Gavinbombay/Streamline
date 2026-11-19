@@ -26,6 +26,7 @@ pub(crate) fn map_trio_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<
     let state_str: String = row.get(9)?;
     let cleanup_verified_int: i64 = row.get(11)?;
     let lessons_satisfied_int: i64 = row.get(12)?;
+    let github_release_int: i64 = row.get(13)?;
     Ok(TrioProject {
         project_id: row.get(0)?,
         create_id: row.get(1)?,
@@ -44,7 +45,9 @@ pub(crate) fn map_trio_project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         how_it_works_resource_id: row.get(10)?,
         cleanup_verified: cleanup_verified_int != 0,
         lessons_satisfied: lessons_satisfied_int != 0,
-        created_at: row.get(13)?,
+        github_release: github_release_int != 0,
+        audit_passed_commit: row.get(14)?,
+        created_at: row.get(15)?,
     })
 }
 
@@ -55,7 +58,8 @@ pub(crate) fn load_project_tx(
     conn.query_row(
         "SELECT project_id, create_id, title, work_kind, difficulty, risk, profile,
                 expected_roles_json, plan_locked_rev, state, how_it_works_resource_id,
-                cleanup_verified, lessons_satisfied, created_at
+                cleanup_verified, lessons_satisfied, github_release, audit_passed_commit,
+                created_at
          FROM trio_projects WHERE project_id = ?1",
         params![project_id],
         map_trio_project_row,
@@ -280,8 +284,8 @@ impl StreamlineStore {
             "INSERT INTO trio_projects (
                 project_id, create_id, recipe_sha256, title, work_kind, difficulty,
                 risk, profile, expected_roles_json, plan_locked_rev, state,
-                how_it_works_resource_id, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'STAGED', NULL, ?10)",
+                how_it_works_resource_id, github_release, audit_passed_commit, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'STAGED', NULL, ?10, NULL, ?11)",
             params![
                 project_id,
                 req.create_id,
@@ -292,6 +296,7 @@ impl StreamlineStore {
                 outcome.risk as i64,
                 outcome.profile.as_str(),
                 roles_json,
+                if req.github_release { 1 } else { 0 },
                 now,
             ],
         )?;
@@ -371,7 +376,8 @@ impl StreamlineStore {
         let mut stmt = conn.prepare(
             "SELECT project_id, create_id, title, work_kind, difficulty, risk, profile,
                     expected_roles_json, plan_locked_rev, state, how_it_works_resource_id,
-                    cleanup_verified, lessons_satisfied, created_at
+                    cleanup_verified, lessons_satisfied, github_release, audit_passed_commit,
+                    created_at
              FROM trio_projects ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], map_trio_project_row)?;
@@ -1216,8 +1222,9 @@ impl StreamlineStore {
         Ok(updated)
     }
 
-    /// Owner-only release gate: verifies `DOC_PENDING_OWNER` state and valid `HOW-IT-WORKS`,
-    /// transitions the project to `DONE`, and promotes accepted (`A`) requirement rows to `L`.
+    /// Owner-only release gate: verifies `DOC_PENDING_OWNER`, closeout prerequisites, and
+    /// valid `HOW-IT-WORKS`. For `github_release` projects without a passing `audit_passed_commit`,
+    /// transitions to `AUDIT_PENDING`; otherwise transitions to `DONE` and promotes `A` rows to `L`.
     pub fn approve_release(
         &self,
         grant_id: &str,
@@ -1242,40 +1249,132 @@ impl StreamlineStore {
             )));
         }
 
-        let how_res_id = project.how_it_works_resource_id.as_deref().ok_or_else(|| {
-            StoreError::InvalidState(format!(
-                "project '{project_id}' has no HOW-IT-WORKS resource attached"
-            ))
-        })?;
-        let how_doc = read_resource_by_id_tx(&tx, how_res_id)?;
-        if let Err(errs) = validate_how_it_works(&how_doc.body_md) {
-            return Err(StoreError::InvalidHowItWorks(errs));
+        let how_res_id = verify_closeout_docs_tx(&tx, &project)?;
+        let needs_security_audit = project.github_release
+            && project
+                .audit_passed_commit
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty();
+
+        if needs_security_audit {
+            tx.execute(
+                "UPDATE trio_projects SET state = 'AUDIT_PENDING' WHERE project_id = ?1",
+                params![project_id],
+            )?;
+            record_audit_tx(
+                &tx,
+                &grant.principal_id,
+                "how_it_works_signed_off_audit_pending",
+                project_id,
+                "ok",
+                serde_json::json!({ "how_it_works_resource_id": how_res_id }),
+            )?;
+        } else {
+            let now = now_rfc3339();
+            tx.execute(
+                "UPDATE trio_projects SET state = 'DONE' WHERE project_id = ?1",
+                params![project_id],
+            )?;
+            promote_accepted_rows_to_live_tx(&tx, project_id, "owner:release-approved", &now)?;
+            record_audit_tx(
+                &tx,
+                &grant.principal_id,
+                "approve_release",
+                project_id,
+                "ok",
+                serde_json::json!({ "how_it_works_resource_id": how_res_id }),
+            )?;
         }
 
+        let bundle = load_project_bundle_tx(&tx, project_id)?;
+        tx.commit()?;
+        Ok(bundle)
+    }
+
+    /// Owner-only security audit sign-off gate: validates a clean audit (`0` confirmed findings,
+    /// `0` needs-validation items, valid commit SHA and skill revision) for `AUDIT_PENDING` or
+    /// `DOC_PENDING_OWNER` projects, records `audit_passed_commit`, transitions to `DONE`, and
+    /// promotes accepted (`A`) requirement rows to `L`.
+    pub fn record_security_audit(
+        &self,
+        grant_id: &str,
+        project_id: &str,
+        audited_commit: &str,
+        skill_revision: &str,
+        confirmed_findings: u32,
+        needs_validation: u32,
+    ) -> Result<TrioProjectBundle, StoreError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let grant = require_rules_acked_tx(&tx, grant_id)?;
+        if !grant.can_write {
+            return Err(StoreError::ForbiddenWrite);
+        }
+        if grant.principal_role != PrincipalRole::Owner {
+            return Err(StoreError::ForbiddenRole(grant.principal_role.to_string()));
+        }
+        check_shelf_access_tx(&tx, &grant, "projects", Some(project_id))?;
+
+        let project = load_project_tx(&tx, project_id)?;
+
+        let commit = audited_commit.trim();
+        if !(7..=64).contains(&commit.len()) || !commit.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return Err(CoreError::InvalidInput(
+                "audited_commit must be 7..=64 hexadecimal characters".to_string(),
+            )
+            .into());
+        }
+        let skill_rev = skill_revision.trim();
+        if skill_rev.is_empty()
+            || skill_rev.len() > 128
+            || skill_rev.chars().any(|ch| ch.is_control())
+        {
+            return Err(CoreError::InvalidInput(
+                "skill_revision must be 1..=128 non-control characters".to_string(),
+            )
+            .into());
+        }
+        if confirmed_findings > 0 || needs_validation > 0 {
+            return Err(CoreError::InvalidInput(format!(
+                "security audit sign-off refused: confirmed_findings={confirmed_findings}, needs_validation={needs_validation}"
+            ))
+            .into());
+        }
+
+        if !matches!(
+            project.state,
+            RunState::AuditPending | RunState::DocPendingOwner
+        ) {
+            return Err(StoreError::InvalidState(format!(
+                "project '{}' is in state {}, expected AUDIT_PENDING or DOC_PENDING_OWNER",
+                project_id, project.state
+            )));
+        }
+
+        let how_res_id = verify_closeout_docs_tx(&tx, &project)?;
         let now = now_rfc3339();
         tx.execute(
-            "UPDATE trio_projects SET state = 'DONE' WHERE project_id = ?1",
-            params![project_id],
+            "UPDATE trio_projects
+             SET audit_passed_commit = ?1, state = 'DONE'
+             WHERE project_id = ?2",
+            params![commit, project_id],
         )?;
-        tx.execute(
-            "UPDATE requirement_rows
-             SET stage = 'L',
-                 evidence_ref = CASE
-                    WHEN TRIM(evidence_ref) = '' THEN 'owner:release-approved'
-                    ELSE evidence_ref
-                 END,
-                 updated_at = ?1
-             WHERE project_id = ?2 AND stage = 'A'",
-            params![now, project_id],
-        )?;
-
+        promote_accepted_rows_to_live_tx(&tx, project_id, "owner:security-audit-passed", &now)?;
         record_audit_tx(
             &tx,
             &grant.principal_id,
-            "approve_release",
+            "record_security_audit",
             project_id,
             "ok",
-            serde_json::json!({ "how_it_works_resource_id": how_res_id }),
+            serde_json::json!({
+                "audited_commit": commit,
+                "skill_revision": skill_rev,
+                "confirmed_findings": confirmed_findings,
+                "needs_validation": needs_validation,
+                "how_it_works_resource_id": how_res_id,
+            }),
         )?;
 
         let bundle = load_project_bundle_tx(&tx, project_id)?;
@@ -1383,4 +1482,54 @@ fn load_requirement_row_tx(
             "requirement '{req_id}' not found in project '{project_id}'"
         ))
     })
+}
+
+fn verify_closeout_docs_tx(conn: &Connection, project: &TrioProject) -> Result<String, StoreError> {
+    if !project.cleanup_verified {
+        return Err(StoreError::InvalidState(
+            "temporary files cleanup must be verified before closeout".to_string(),
+        ));
+    }
+    let has_project_lesson: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM lessons_learned WHERE project_id = ?1)",
+        params![project.project_id],
+        |row| row.get(0),
+    )?;
+    if !project.lessons_satisfied && !has_project_lesson {
+        return Err(StoreError::InvalidState(
+            "lessons learned must be recorded to the central learning database before closeout"
+                .to_string(),
+        ));
+    }
+    let how_res_id = project.how_it_works_resource_id.as_deref().ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "project '{}' has no HOW-IT-WORKS resource attached",
+            project.project_id
+        ))
+    })?;
+    let how_doc = read_resource_by_id_tx(conn, how_res_id)?;
+    if let Err(errs) = validate_how_it_works(&how_doc.body_md) {
+        return Err(StoreError::InvalidHowItWorks(errs));
+    }
+    Ok(how_res_id.to_string())
+}
+
+fn promote_accepted_rows_to_live_tx(
+    conn: &Connection,
+    project_id: &str,
+    default_evidence: &str,
+    now: &str,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE requirement_rows
+         SET stage = 'L',
+             evidence_ref = CASE
+                WHEN TRIM(evidence_ref) = '' THEN ?1
+                ELSE evidence_ref
+             END,
+             updated_at = ?2
+         WHERE project_id = ?3 AND stage = 'A'",
+        params![default_evidence, now, project_id],
+    )?;
+    Ok(())
 }

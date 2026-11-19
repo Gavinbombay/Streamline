@@ -580,7 +580,8 @@ impl StreamlineStore {
             let mut stmt = conn.prepare(
                 "SELECT project_id, create_id, title, work_kind, difficulty, risk, profile,
                         expected_roles_json, plan_locked_rev, state, how_it_works_resource_id,
-                        cleanup_verified, lessons_satisfied, created_at
+                        cleanup_verified, lessons_satisfied, github_release, audit_passed_commit,
+                        created_at
                  FROM trio_projects
                  WHERE state != 'DONE'
                  ORDER BY created_at DESC",

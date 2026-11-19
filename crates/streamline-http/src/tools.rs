@@ -45,7 +45,7 @@ pub struct ReadyStatus {
     pub current_rules_sha256: String,
 }
 
-pub const KNOWN_TOOLS: [&str; 42] = [
+pub const KNOWN_TOOLS: [&str; 44] = [
     "ready",
     "bootstrap",
     "ack_rules",
@@ -85,6 +85,8 @@ pub const KNOWN_TOOLS: [&str; 42] = [
     "query_lessons",
     "submit_how_it_works",
     "approve_release",
+    "approve_how_it_works",
+    "record_security_audit",
     "export_trajectory",
     "sync_vault",
     "export_workspace",
@@ -107,7 +109,7 @@ pub fn compute_ready_status(state: &AppState) -> Result<ReadyStatus, ApiError> {
     })
 }
 
-/// Returns MCP `tools/list` metadata and JSON Schemas for all 42 tools.
+/// Returns MCP `tools/list` metadata and JSON Schemas for all 44 tools.
 pub fn tools_list() -> Vec<McpToolDescriptor> {
     vec![
         McpToolDescriptor {
@@ -305,7 +307,8 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
                     "assessment": { "type": "object" },
                     "opt_in_modules": { "type": "array", "items": { "type": "string" } },
                     "initial_own_decisions": { "type": "array", "items": { "type": "object" } },
-                    "initial_requirements": { "type": "array", "items": { "type": "object" } }
+                    "initial_requirements": { "type": "array", "items": { "type": "object" } },
+                    "github_release": { "type": "boolean" }
                 },
                 "required": ["project_id", "title", "assessment"]
             }),
@@ -587,13 +590,45 @@ pub fn tools_list() -> Vec<McpToolDescriptor> {
         },
         McpToolDescriptor {
             name: "approve_release",
-            description: "Owner-only release approval: transitions DOC_PENDING_OWNER -> DONE and promotes A rows to L.",
+            description: "Owner-only HOW-IT-WORKS release approval: for github_release projects without a recorded passing audit, transitions DOC_PENDING_OWNER -> AUDIT_PENDING until record_security_audit passes with zero open findings; otherwise transitions to DONE and promotes A rows to L.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_id": { "type": "string" }
                 },
                 "required": ["project_id"]
+            }),
+        },
+        McpToolDescriptor {
+            name: "approve_how_it_works",
+            description: "Alias for approve_release: Owner-only HOW-IT-WORKS sign-off (transitions github_release projects to AUDIT_PENDING until record_security_audit passes).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" }
+                },
+                "required": ["project_id"]
+            }),
+        },
+        McpToolDescriptor {
+            name: "record_security_audit",
+            description: "Owner-only security audit gate: requires 0 confirmed findings, 0 needs-validation items, and valid commit/skill metadata; transitions AUDIT_PENDING or DOC_PENDING_OWNER -> DONE and promotes A rows to L.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "audited_commit": { "type": "string", "minLength": 7, "maxLength": 64 },
+                    "skill_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "confirmed_findings": { "type": "integer", "minimum": 0 },
+                    "needs_validation": { "type": "integer", "minimum": 0 }
+                },
+                "required": [
+                    "project_id",
+                    "audited_commit",
+                    "skill_revision",
+                    "confirmed_findings",
+                    "needs_validation"
+                ]
             }),
         },
         McpToolDescriptor {
@@ -930,6 +965,7 @@ pub fn dispatch_tool(
                 opt_in_modules: args.opt_in_modules,
                 initial_own_decisions: args.initial_own_decisions,
                 initial_requirements: args.initial_requirements,
+                github_release: args.github_release,
             };
             let bundle = state
                 .store
@@ -1261,30 +1297,48 @@ pub fn dispatch_tool(
             )?;
             Ok(serde_json::to_value(proj)?)
         }
-        "approve_release" => {
+        "approve_release" | "approve_how_it_works" => {
             let active_grant = require_grant(grant)?;
+            require_owner(active_grant)?;
             let args: ProjectIdArgs = parse_args(raw_args)?;
             check_safe_segment("project_id", &args.project_id)?;
             let bundle = state
                 .store
                 .approve_release(&active_grant.grant_id, &args.project_id)?;
-            let vault_dir = state.config.vault_sync_dir.trim();
-            if !vault_dir.is_empty() {
-                if let Err(err) = state.store.sync_vault_dir(Path::new(vault_dir)) {
-                    tracing::warn!(error = %err, "best-effort vault sync after approve_release skipped");
-                }
+            post_release_exports(state, &active_grant.grant_id, &bundle, "approve_release");
+            Ok(serde_json::to_value(bundle)?)
+        }
+        "record_security_audit" => {
+            let active_grant = require_grant(grant)?;
+            require_owner(active_grant)?;
+            let args: RecordSecurityAuditArgs = parse_args(raw_args)?;
+            check_safe_segment("project_id", &args.project_id)?;
+            if args.skill_revision.trim().is_empty() || args.skill_revision.trim().len() > 128 {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "UNPROCESSABLE",
+                    "skill_revision must be 1..=128 characters",
+                ));
             }
-            let runs_dir = state.config.runs_dir.trim();
-            if !runs_dir.is_empty() {
-                if let Err(err) = export_bundle_trajectory(
-                    state,
-                    &active_grant.grant_id,
-                    &bundle,
-                    Path::new(runs_dir),
-                ) {
-                    tracing::warn!(error = %err.message, "best-effort trajectory export after approve_release skipped");
-                }
-            }
+            check_safe_text(
+                "skill_revision",
+                &args.skill_revision,
+                &state.redaction_policy,
+            )?;
+            let bundle = state.store.record_security_audit(
+                &active_grant.grant_id,
+                &args.project_id,
+                &args.audited_commit,
+                &args.skill_revision,
+                args.confirmed_findings,
+                args.needs_validation,
+            )?;
+            post_release_exports(
+                state,
+                &active_grant.grant_id,
+                &bundle,
+                "record_security_audit",
+            );
             Ok(serde_json::to_value(bundle)?)
         }
         "export_trajectory" => {
@@ -1661,6 +1715,29 @@ fn handle_dispatch_run(
     Ok(serde_json::to_value(outcome)?)
 }
 
+fn post_release_exports(
+    state: &AppState,
+    grant_id: &str,
+    bundle: &TrioProjectBundle,
+    action_label: &str,
+) {
+    let vault_dir = state.config.vault_sync_dir.trim();
+    if !vault_dir.is_empty() {
+        if let Err(err) = state.store.sync_vault_dir(Path::new(vault_dir)) {
+            tracing::warn!(error = %err, action = action_label, "best-effort vault sync skipped");
+        }
+    }
+    if bundle.project.state == streamline_core::RunState::Done {
+        let runs_dir = state.config.runs_dir.trim();
+        if !runs_dir.is_empty() {
+            if let Err(err) = export_bundle_trajectory(state, grant_id, bundle, Path::new(runs_dir))
+            {
+                tracing::warn!(error = %err.message, action = action_label, "best-effort trajectory export skipped");
+            }
+        }
+    }
+}
+
 fn export_bundle_trajectory(
     state: &AppState,
     grant_id: &str,
@@ -1852,6 +1929,17 @@ struct CreateTrioProjectArgs {
     initial_own_decisions: Vec<OwnDecisionInput>,
     #[serde(default)]
     initial_requirements: Vec<RequirementRowInput>,
+    #[serde(default)]
+    github_release: bool,
+}
+
+#[derive(Deserialize)]
+struct RecordSecurityAuditArgs {
+    project_id: String,
+    audited_commit: String,
+    skill_revision: String,
+    confirmed_findings: u32,
+    needs_validation: u32,
 }
 
 #[derive(Deserialize)]

@@ -423,6 +423,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                 source_id: "OWN-001".to_string(),
                 statement: "Serve GET /ready on 127.0.0.1:5880".to_string(),
             }],
+            github_release: false,
         };
 
         let bundle1 = store
@@ -855,6 +856,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                     opt_in_modules: Vec::new(),
                     initial_own_decisions: Vec::new(),
                     initial_requirements: Vec::new(),
+                    github_release: false,
                 },
             )
             .expect("create project");
@@ -1155,6 +1157,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                         statement: "Original choice".to_string(),
                     }],
                     initial_requirements: Vec::new(),
+                    github_release: false,
                 },
             )
             .expect("create project");
@@ -1246,6 +1249,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                         source_id: "PLAN".to_string(),
                         statement: "Enforce grant-bound family provenance".to_string(),
                     }],
+                    github_release: false,
                 },
             )
             .expect("create R2 project");
@@ -1410,6 +1414,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                         source_id: "OWN-001".to_string(),
                         statement: "Bind 127.0.0.1".to_string(),
                     }],
+                    github_release: false,
                 },
             )
             .expect("create project");
@@ -1593,6 +1598,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                         source_id: "OWN-001".to_string(),
                         statement: "Original statement".to_string(),
                     }],
+                    github_release: false,
                 },
             )
             .expect("create project");
@@ -2008,6 +2014,7 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
                         source_id: "OWN-001".to_string(),
                         statement: "Verify custodian spoofing blocked".to_string(),
                     }],
+                    github_release: false,
                 },
             )
             .expect("create project");
@@ -2127,5 +2134,233 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
             .expect("get bundle");
         assert_eq!(bundle_after.requirements[0].stage, ReqStage::L);
         assert_eq!(bundle_after.requirements[0].evidence_ref, orig_evidence);
+    }
+
+    #[test]
+    fn github_release_transitions_to_audit_pending_and_requires_clean_security_audit() {
+        let store = StreamlineStore::open_in_memory().expect("open store");
+        let owner = seed_owner_grant(&store);
+        let worker = seed_agent_grant_with_family(
+            &store,
+            "worker",
+            "cred-worker-audit",
+            vec!["projects".to_string()],
+            Some("openai-codex"),
+        );
+        let acceptor = seed_agent_grant_with_family(
+            &store,
+            "acceptor",
+            "cred-acceptor-audit",
+            vec!["projects".to_string()],
+            Some("google-gemini"),
+        );
+        let rules_sha = store.current_rules_sha256().expect("rules sha");
+        store
+            .ack_rules(&owner.grant_id, &rules_sha)
+            .expect("ack owner");
+        store
+            .ack_rules(&worker.grant_id, &rules_sha)
+            .expect("ack worker");
+        store
+            .ack_rules(&acceptor.grant_id, &rules_sha)
+            .expect("ack acceptor");
+
+        let created = store
+            .create_trio_project(
+                &owner.grant_id,
+                CreateTrioProjectRequest {
+                    project_id: "gh-pub-01".to_string(),
+                    create_id: None,
+                    title: "Public Release Project".to_string(),
+                    assessment: sample_assessment(),
+                    opt_in_modules: Vec::new(),
+                    initial_own_decisions: vec![OwnDecisionInput {
+                        own_id: "OWN-001".to_string(),
+                        statement: "Require clean security audit before public release".to_string(),
+                    }],
+                    initial_requirements: vec![RequirementRowInput {
+                        req_id: "REQ-01".to_string(),
+                        source_id: "OWN-001".to_string(),
+                        statement: "Gate release on 0 confirmed and 0 needs-validation".to_string(),
+                    }],
+                    github_release: true,
+                },
+            )
+            .expect("create github_release project");
+        assert!(created.project.github_release);
+        assert_eq!(created.project.audit_passed_commit, None);
+
+        store
+            .lock_project_plan(&owner.grant_id, "gh-pub-01", None)
+            .expect("lock plan");
+        store
+            .update_requirement_stage(
+                &worker.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "gh-pub-01".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::T,
+                    evidence_ref: "cargo test".to_string(),
+                    actor_family: Some("openai-codex".to_string()),
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark T");
+        store
+            .update_requirement_stage(
+                &acceptor.grant_id,
+                UpdateRequirementStageRequest {
+                    project_id: "gh-pub-01".to_string(),
+                    req_id: "REQ-01".to_string(),
+                    target_stage: ReqStage::A,
+                    evidence_ref: "accepted".to_string(),
+                    actor_family: Some("google-gemini".to_string()),
+                    actor_is_custodian: false,
+                },
+            )
+            .expect("mark A");
+
+        store
+            .mark_project_cleanup_verified(&worker.grant_id, "gh-pub-01", "clean")
+            .expect("cleanup verified");
+        store
+            .record_no_new_lessons(&worker.grant_id, "gh-pub-01", "no new lessons")
+            .expect("lessons satisfied");
+        store
+            .submit_how_it_works(&worker.grant_id, "gh-pub-01", valid_how_it_works(), None)
+            .expect("submit how it works");
+
+        // Owner approve_release on github_release=true without audit transitions to AUDIT_PENDING.
+        let audit_pending = store
+            .approve_release(&owner.grant_id, "gh-pub-01")
+            .expect("approve_release to AUDIT_PENDING");
+        assert_eq!(audit_pending.project.state, RunState::AuditPending);
+        assert_eq!(audit_pending.requirements[0].stage, ReqStage::A);
+        assert_eq!(audit_pending.project.audit_passed_commit, None);
+
+        // Non-owner cannot call record_security_audit (even for nonexistent IDs -> ForbiddenRole).
+        let worker_existing =
+            store.record_security_audit(&worker.grant_id, "gh-pub-01", "4446b50c", "c1c8a8c", 0, 0);
+        assert!(matches!(worker_existing, Err(StoreError::ForbiddenRole(_))));
+        let worker_missing = store.record_security_audit(
+            &worker.grant_id,
+            "does-not-exist",
+            "4446b50c",
+            "c1c8a8c",
+            0,
+            0,
+        );
+        assert!(matches!(worker_missing, Err(StoreError::ForbiddenRole(_))));
+
+        // Invalid commit SHAs and open findings are rejected.
+        let bad_hex = store.record_security_audit(
+            &owner.grant_id,
+            "gh-pub-01",
+            "not-hex-sha",
+            "c1c8a8c",
+            0,
+            0,
+        );
+        assert!(matches!(
+            bad_hex,
+            Err(StoreError::Core(CoreError::InvalidInput(_)))
+        ));
+        let short_hex =
+            store.record_security_audit(&owner.grant_id, "gh-pub-01", "4446b5", "c1c8a8c", 0, 0);
+        assert!(matches!(
+            short_hex,
+            Err(StoreError::Core(CoreError::InvalidInput(_)))
+        ));
+        let open_confirmed = store.record_security_audit(
+            &owner.grant_id,
+            "gh-pub-01",
+            "4446b50c6a640544c4bc66cde51e227323d8db98",
+            "c1c8a8c",
+            1,
+            0,
+        );
+        assert!(matches!(
+            open_confirmed,
+            Err(StoreError::Core(CoreError::InvalidInput(_)))
+        ));
+        let open_needs_val = store.record_security_audit(
+            &owner.grant_id,
+            "gh-pub-01",
+            "4446b50c6a640544c4bc66cde51e227323d8db98",
+            "c1c8a8c",
+            0,
+            2,
+        );
+        assert!(matches!(
+            open_needs_val,
+            Err(StoreError::Core(CoreError::InvalidInput(_)))
+        ));
+
+        // Clean 0/0 audit transitions AUDIT_PENDING -> DONE and promotes A -> L.
+        let done_bundle = store
+            .record_security_audit(
+                &owner.grant_id,
+                "gh-pub-01",
+                "4446b50c6a640544c4bc66cde51e227323d8db98",
+                "c1c8a8c14710",
+                0,
+                0,
+            )
+            .expect("record clean security audit");
+        assert_eq!(done_bundle.project.state, RunState::Done);
+        assert_eq!(
+            done_bundle.project.audit_passed_commit.as_deref(),
+            Some("4446b50c6a640544c4bc66cde51e227323d8db98")
+        );
+        assert_eq!(done_bundle.requirements[0].stage, ReqStage::L);
+    }
+
+    #[test]
+    fn legacy_sqlite_db_without_audit_columns_migrates_cleanly_on_open() {
+        let dir = TempDirGuard::new("streamline-legacy-migrate");
+        let db_path = dir.path.join("streamline.sqlite3");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+            conn.execute_batch(
+                "CREATE TABLE trio_projects (
+                    project_id TEXT PRIMARY KEY,
+                    create_id TEXT UNIQUE,
+                    recipe_sha256 TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    work_kind TEXT NOT NULL,
+                    difficulty INTEGER NOT NULL,
+                    risk INTEGER NOT NULL,
+                    profile TEXT NOT NULL,
+                    expected_roles_json TEXT NOT NULL,
+                    plan_locked_rev INTEGER,
+                    state TEXT NOT NULL,
+                    how_it_works_resource_id TEXT,
+                    cleanup_verified INTEGER NOT NULL DEFAULT 0,
+                    lessons_satisfied INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO trio_projects (
+                    project_id, create_id, recipe_sha256, title, work_kind, difficulty,
+                    risk, profile, expected_roles_json, plan_locked_rev, state,
+                    how_it_works_resource_id, cleanup_verified, lessons_satisfied, created_at
+                ) VALUES (
+                    'legacy-p1', NULL, 'abc123', 'Legacy Project', 'software', 1,
+                    1, 'P1', '[\"plan\"]', NULL, 'DOC_PENDING_OWNER',
+                    NULL, 1, 1, '2026-11-18T00:00:00Z'
+                );",
+            )
+            .expect("seed pre-v011 trio_projects table");
+        }
+
+        let store = StreamlineStore::open(&db_path).expect("open migrated store");
+        let owner = seed_owner_grant(&store);
+        let bundle = store
+            .get_project_bundle(&owner.grant_id, "legacy-p1")
+            .expect("load migrated project");
+        assert_eq!(bundle.project.project_id, "legacy-p1");
+        assert_eq!(bundle.project.state, RunState::DocPendingOwner);
+        assert!(!bundle.project.github_release);
+        assert_eq!(bundle.project.audit_passed_commit, None);
     }
 }

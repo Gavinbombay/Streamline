@@ -1323,7 +1323,7 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/?panel=passport")
+                .uri("/")
                 .body(Body::empty())
                 .expect("build UI request"),
         )
@@ -1336,14 +1336,15 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
         .expect("read UI HTML bytes");
     let html = String::from_utf8(bytes.to_vec()).expect("valid UTF-8 HTML");
 
-    // Verify all 6 sidebar navigation tabs.
+    // Verify all 7 authentic Streamline navigation tabs.
     for nav_tab in [
-        "data-view=\"overview\"",
+        "data-view=\"home\"",
+        "data-view=\"profile\"",
         "data-view=\"projects\"",
-        "data-view=\"shelves\"",
-        "data-view=\"inbox\"",
+        "data-view=\"library\"",
         "data-view=\"lessons\"",
         "data-view=\"apps\"",
+        "data-view=\"settings\"",
     ] {
         assert!(
             html.contains(nav_tab),
@@ -1351,28 +1352,46 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
         );
     }
 
-    // Verify DOC-PENDING-OWNER approval inbox, Dormant/Legacy triage controls, and Lock Plan beside Compare.
+    // Verify authentic Streamline design assets, human flows, triage controls, and release gate controls.
     for expected in [
-        "DOC-PENDING-OWNER",
-        "Approval Inbox (DOC-PENDING-OWNER)",
-        "Dormant",
-        "Legacy",
-        "Needs Triage",
+        "Bricolage Grotesque",
+        "/_streamline/assets/fonts/bricolage-grotesque-latin.woff2",
+        "/_streamline/assets/fonts/inter-latin.woff2",
+        "/_streamline/assets/artwork/streamline-nebula.svg",
+        "/_streamline/assets/artwork/streamline-streaks.svg",
+        "/_streamline/assets/artwork/streamline-grain.svg",
+        "/_streamline/assets/mark.svg",
+        "streamline-calm",
+        "streamline_workspace_key",
+        "set_lifecycle_tier",
         "Keep Dormant",
         "Promote to Active",
         "Archive Retired",
-        "/api/tools/set_lifecycle_tier",
-        "Lock Plan Version",
-        "id=\"lock-plan-btn\"",
-        "id=\"compare-plan-btn\"",
-        "Compare",
-        "History &amp; Restore",
+        "Approve HOW-IT-WORKS",
+        "GitHub public release (requires security audit after HOW-IT-WORKS)",
+        "Plan vs As-Built",
+        "lock-plan-btn",
+        "compare-plan-btn",
         "Source Passport",
+        "Sync Obsidian vault",
+        "Download workspace",
         "optional-modules-details",
     ] {
         assert!(
             html.contains(expected),
             "UI missing interactive fragment {expected}"
+        );
+    }
+
+    // Verify no legacy 3-column dev console jargon appears in rendered HTML.
+    for forbidden in [
+        "DOC-PENDING-OWNER",
+        "Approval Inbox (DOC-PENDING-OWNER)",
+        "Rules digest:",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "UI must not render dev-console jargon {forbidden}"
         );
     }
 
@@ -1397,6 +1416,114 @@ async fn ui_renders_interactive_three_pane_tabs_and_triage_controls() {
     );
     assert!(!html.contains('\u{2014}'), "UI must not contain em dash");
     assert!(!html.contains('\u{2013}'), "UI must not contain en dash");
+}
+
+#[tokio::test]
+async fn static_assets_serve_embedded_fonts_and_artwork() {
+    let app = build_router(make_test_state(StreamlineConfig::default()));
+
+    for font_name in [
+        "bricolage-grotesque-latin.woff2",
+        "bricolage-grotesque-latin-ext.woff2",
+        "inter-latin.woff2",
+        "inter-latin-ext.woff2",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/_streamline/assets/fonts/{font_name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "font {font_name}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("font/woff2")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=86400")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(!bytes.is_empty(), "font {font_name} must be non-empty");
+    }
+
+    for uri in [
+        "/_streamline/assets/artwork/streamline-grain.svg",
+        "/_streamline/assets/artwork/streamline-nebula.svg",
+        "/_streamline/assets/artwork/streamline-streaks.svg",
+        "/_streamline/assets/mark.svg",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "artwork {uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=86400")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("<svg"), "artwork {uri} must contain <svg");
+    }
+
+    for missing_uri in [
+        "/_streamline/assets/fonts/nonexistent.woff2",
+        "/_streamline/assets/artwork/nonexistent.svg",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(missing_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "missing {missing_uri}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2230,4 +2357,330 @@ async fn skills_zip_and_presence_plugin_reject_symlinks_and_body_cap_enforced() 
         .await
         .unwrap();
     assert_eq!(limit_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+async fn rest_call(
+    router: &axum::Router,
+    cred: Option<&str>,
+    tool_name: &str,
+    body_json: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/tools/{tool_name}"))
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(raw) = cred {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {raw}"));
+    }
+    let req = builder
+        .body(Body::from(body_json.to_string()))
+        .expect("build rest request");
+    let resp = router
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("execute rest request");
+    read_json_body(resp).await
+}
+
+#[tokio::test]
+async fn http_github_release_audit_gate_enforces_owner_403_validation_422_and_done_transition() {
+    let state = make_test_state(StreamlineConfig::default());
+    let owner_cred = "test-owner-audit-cred";
+    let worker_cred = "test-worker-audit-cred";
+    let acceptor_cred = "test-acceptor-audit-cred";
+    let owner_grant = seed_grant_with_family(
+        &state.store,
+        "owner-audit",
+        PrincipalRole::Owner,
+        owner_cred,
+        vec!["*".to_string()],
+        Some("anthropic-claude"),
+    );
+    let worker_grant = seed_grant_with_family(
+        &state.store,
+        "worker-audit",
+        PrincipalRole::Agent,
+        worker_cred,
+        vec!["projects".to_string()],
+        Some("openai-codex"),
+    );
+    let acceptor_grant = seed_grant_with_family(
+        &state.store,
+        "acceptor-audit",
+        PrincipalRole::Agent,
+        acceptor_cred,
+        vec!["projects".to_string()],
+        Some("google-gemini"),
+    );
+    let rules_sha = state.store.current_rules_sha256().expect("rules sha");
+    state
+        .store
+        .ack_rules(&owner_grant, &rules_sha)
+        .expect("ack owner");
+    state
+        .store
+        .ack_rules(&worker_grant, &rules_sha)
+        .expect("ack worker");
+    state
+        .store
+        .ack_rules(&acceptor_grant, &rules_sha)
+        .expect("ack acceptor");
+
+    let app = build_router(state);
+
+    let (ready_status, ready_json) = read_json_body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ready_status, StatusCode::OK);
+    assert_eq!(ready_json["version"], "0.1.1");
+
+    let (create_status, create_json) = rest_call(
+        &app,
+        Some(owner_cred),
+        "create_trio_project",
+        json!({
+            "project_id": "http-gh-audit",
+            "title": "HTTP GitHub Release Audit Gate",
+            "github_release": true,
+            "assessment": {
+                "d1_scope": 2,
+                "d2_interfaces": 1,
+                "d3_uncertainty": 1,
+                "d4_ui": 0,
+                "d5_novelty": 1,
+                "r1_exposure": 2,
+                "r2_irreversibility": 1,
+                "r3_blast_radius": 1,
+                "r4_evidence": 1,
+                "r5_custody": 1,
+                "work_kind": "software"
+            },
+            "initial_own_decisions": [{
+                "own_id": "OWN-001",
+                "statement": "Enforce security audit gate on public release"
+            }],
+            "initial_requirements": [{
+                "req_id": "REQ-01",
+                "source_id": "OWN-001",
+                "statement": "Transition to AUDIT_PENDING before DONE"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        create_status,
+        StatusCode::OK,
+        "create failed: {create_json}"
+    );
+    assert_eq!(create_json["data"]["project"]["github_release"], true);
+
+    let (lock_status, _) = rest_call(
+        &app,
+        Some(owner_cred),
+        "lock_project_plan",
+        json!({ "project_id": "http-gh-audit" }),
+    )
+    .await;
+    assert_eq!(lock_status, StatusCode::OK);
+
+    let (t_status, _) = rest_call(
+        &app,
+        Some(worker_cred),
+        "update_requirement_stage",
+        json!({
+            "project_id": "http-gh-audit",
+            "req_id": "REQ-01",
+            "target_stage": "T",
+            "evidence_ref": "cargo test"
+        }),
+    )
+    .await;
+    assert_eq!(t_status, StatusCode::OK);
+
+    let (a_status, _) = rest_call(
+        &app,
+        Some(acceptor_cred),
+        "update_requirement_stage",
+        json!({
+            "project_id": "http-gh-audit",
+            "req_id": "REQ-01",
+            "target_stage": "A",
+            "evidence_ref": "cross-family ok"
+        }),
+    )
+    .await;
+    assert_eq!(a_status, StatusCode::OK);
+
+    let (cleanup_status, _) = rest_call(
+        &app,
+        Some(worker_cred),
+        "mark_project_cleanup_verified",
+        json!({ "project_id": "http-gh-audit", "detail": "clean" }),
+    )
+    .await;
+    assert_eq!(cleanup_status, StatusCode::OK);
+
+    let (lesson_status, _) = rest_call(
+        &app,
+        Some(worker_cred),
+        "record_no_new_lessons",
+        json!({ "project_id": "http-gh-audit", "reason": "none" }),
+    )
+    .await;
+    assert_eq!(lesson_status, StatusCode::OK);
+
+    let (how_status, how_json) = rest_call(
+        &app,
+        Some(worker_cred),
+        "submit_how_it_works",
+        json!({
+            "project_id": "http-gh-audit",
+            "markdown": valid_how_it_works_doc()
+        }),
+    )
+    .await;
+    assert_eq!(how_status, StatusCode::OK);
+    assert_eq!(how_json["data"]["state"], "DOC_PENDING_OWNER");
+
+    // Approve via approve_how_it_works alias -> AUDIT_PENDING (not DONE / L).
+    let (appr_status, appr_json) = rest_call(
+        &app,
+        Some(owner_cred),
+        "approve_how_it_works",
+        json!({ "project_id": "http-gh-audit" }),
+    )
+    .await;
+    assert_eq!(appr_status, StatusCode::OK, "approve failed: {appr_json}");
+    assert_eq!(appr_json["data"]["project"]["state"], "AUDIT_PENDING");
+    assert_eq!(appr_json["data"]["requirements"][0]["stage"], "A");
+
+    // Non-owner rejected with 403 (even on nonexistent ID).
+    let (worker_audit_status, _) = rest_call(
+        &app,
+        Some(worker_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "http-gh-audit",
+            "audited_commit": "4446b50c",
+            "skill_revision": "c1c8a8c",
+            "confirmed_findings": 0,
+            "needs_validation": 0
+        }),
+    )
+    .await;
+    assert_eq!(worker_audit_status, StatusCode::FORBIDDEN);
+
+    let (worker_missing_status, _) = rest_call(
+        &app,
+        Some(worker_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "no-such-project",
+            "audited_commit": "4446b50c",
+            "skill_revision": "c1c8a8c",
+            "confirmed_findings": 0,
+            "needs_validation": 0
+        }),
+    )
+    .await;
+    assert_eq!(worker_missing_status, StatusCode::FORBIDDEN);
+
+    // Owner on missing project returns 404.
+    let (owner_missing_status, _) = rest_call(
+        &app,
+        Some(owner_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "no-such-project",
+            "audited_commit": "4446b50c",
+            "skill_revision": "c1c8a8c",
+            "confirmed_findings": 0,
+            "needs_validation": 0
+        }),
+    )
+    .await;
+    assert_eq!(owner_missing_status, StatusCode::NOT_FOUND);
+
+    // Non-zero findings and invalid SHA return 422.
+    let (findings_status, _) = rest_call(
+        &app,
+        Some(owner_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "http-gh-audit",
+            "audited_commit": "4446b50c6a640544c4bc66cde51e227323d8db98",
+            "skill_revision": "c1c8a8c",
+            "confirmed_findings": 1,
+            "needs_validation": 0
+        }),
+    )
+    .await;
+    assert_eq!(findings_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (needs_val_status, _) = rest_call(
+        &app,
+        Some(owner_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "http-gh-audit",
+            "audited_commit": "4446b50c6a640544c4bc66cde51e227323d8db98",
+            "skill_revision": "c1c8a8c",
+            "confirmed_findings": 0,
+            "needs_validation": 1
+        }),
+    )
+    .await;
+    assert_eq!(needs_val_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (bad_sha_status, _) = rest_call(
+        &app,
+        Some(owner_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "http-gh-audit",
+            "audited_commit": "zzzz1234",
+            "skill_revision": "c1c8a8c",
+            "confirmed_findings": 0,
+            "needs_validation": 0
+        }),
+    )
+    .await;
+    assert_eq!(bad_sha_status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Clean 0/0 audit -> DONE + L.
+    let (clean_status, clean_json) = rest_call(
+        &app,
+        Some(owner_cred),
+        "record_security_audit",
+        json!({
+            "project_id": "http-gh-audit",
+            "audited_commit": "4446b50c6a640544c4bc66cde51e227323d8db98",
+            "skill_revision": "c1c8a8c14710",
+            "confirmed_findings": 0,
+            "needs_validation": 0
+        }),
+    )
+    .await;
+    assert_eq!(
+        clean_status,
+        StatusCode::OK,
+        "clean audit failed: {clean_json}"
+    );
+    assert_eq!(clean_json["data"]["project"]["state"], "DONE");
+    assert_eq!(
+        clean_json["data"]["project"]["audit_passed_commit"],
+        "4446b50c6a640544c4bc66cde51e227323d8db98"
+    );
+    assert_eq!(clean_json["data"]["requirements"][0]["stage"], "L");
 }

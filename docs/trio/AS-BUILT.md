@@ -1,0 +1,17 @@
+# Streamline As-Built Record
+
+## v0.1.0 Baseline (`4446b50c6a640544c4bc66cde51e227323d8db98`)
+
+- **Core workspace**: Single-binary Rust (`1.98.1`) + Axum + SQLite (`rusqlite`) server across five crates (`streamline-core`, `streamline-safe`, `streamline-store`, `streamline-conveyor`, `streamline-http`) with `42` MCP/REST tools, two-way Obsidian markdown sync, `bootstrap` -> `ack_rules` (`412 RULES_ACK_REQUIRED`), tag-scoped grants with uniform `404` isolation, `streamline-safe` (`422 REDACTION_BLOCKED`), Unix-only root-walked `PinnedDir`, `P0`..`P4` Trio+ plan locking, central `lessons_learned`, `DOC_PENDING_OWNER` closeout gate, and hands-off conveyor staging/quarantine/cross-family QC.
+- **Verification**: `75` passed, `0` failed across the Cargo workspace (`26` `streamline-conveyor`, `16` `streamline-safe`, `14` `streamline-store`, `12` `streamline-http`, `7` `streamline-core`), Pass 11 security audit (`CLEAN_PASS`, `0` open findings), and `0/0/0` hygiene scan.
+
+## v0.1.1 Update (Streamline Workspace UI & GitHub Release Audit Gate)
+
+- **Authentic Streamline workspace UI (`crates/streamline-http/src/ui.rs`)**: Ported the full seven-view top-navigation workspace (`Home`, `My profile`, `Projects`, `Library`, `Lessons`, `Connected apps`, `Settings`) with locked Streamline dark-palette CSS tokens (`#050817`, `#101a35`, `#3969f8`, `#74d8ff`, `#94ead1`), `16px`/`14px` readability floors, `44px` interactive targets, `Calm mode` toggle (hiding decorative nebula, grain, and streak artwork), and the preserved `streamline-presence-slot` (`presence_plugin_dir` boundary).
+- **Embedded OFL fonts and SVG artwork (`crates/streamline-http/assets/`, `crates/streamline-http/src/lib.rs`, `NOTICE`)**: Bundled self-hosted WOFF2 font subsets for `Bricolage Grotesque` and `Inter` (SIL OFL `1.1`, attributed in `NOTICE`) alongside `mark.svg`, `streamline-grain.svg`, `streamline-nebula.svg`, and `streamline-streaks.svg` served via `/_streamline/assets/fonts/:name`, `/_streamline/assets/artwork/:name`, and `/_streamline/assets/mark.svg`.
+- **Mechanical `HOW-IT-WORKS` -> `AUDIT_PENDING` -> `DONE` gate (`streamline-core`, `streamline-store`, `streamline-http`)**:
+  - Added `github_release` and `audit_passed_commit` columns on `trio_projects` (with automatic idempotent SQLite migration for existing databases).
+  - Added `RunState::AuditPending` (`AUDIT_PENDING`) and `RunPhase::SecurityAudit` (`SECURITY_AUDIT`).
+  - Added `approve_how_it_works` (alias for `approve_release`) and owner-only `record_security_audit` (expanding the MCP/REST registry to `44` tools).
+  - For `github_release: true` projects without a recorded passing `audit_passed_commit`, owner sign-off on `HOW-IT-WORKS.md` transitions `DOC_PENDING_OWNER` -> `AUDIT_PENDING` rather than `DONE`; `record_security_audit` requires owner role (`403` otherwise), `AUDIT_PENDING` or `DOC_PENDING_OWNER` state, a valid `7..=64` hex `audited_commit` SHA, valid `skill_revision`, `0` confirmed findings, and `0` needs-validation items (`422` otherwise) before recording `audit_passed_commit`, transitioning to `DONE`, and promoting `A` requirement rows to `L`.
+- **Verification**: `80 passed, 0 failed` across the Cargo workspace (`26` `streamline-conveyor`, `8` `streamline-core`, `14` `streamline-http`, `16` `streamline-safe`, `16` `streamline-store`), `cargo fmt --all -- --check`, and `cargo clippy --locked --workspace --all-targets -- -D warnings`.

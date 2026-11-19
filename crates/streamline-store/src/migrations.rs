@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS trio_projects (
     how_it_works_resource_id TEXT,
     cleanup_verified INTEGER NOT NULL DEFAULT 0,
     lessons_satisfied INTEGER NOT NULL DEFAULT 0,
+    github_release INTEGER NOT NULL DEFAULT 0,
+    audit_passed_commit TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -247,6 +249,18 @@ fn ensure_trio_closeout_columns(conn: &Connection) -> Result<(), StoreError> {
     if !existing.contains("lessons_satisfied") {
         conn.execute(
             "ALTER TABLE trio_projects ADD COLUMN lessons_satisfied INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !existing.contains("github_release") {
+        conn.execute(
+            "ALTER TABLE trio_projects ADD COLUMN github_release INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !existing.contains("audit_passed_commit") {
+        conn.execute(
+            "ALTER TABLE trio_projects ADD COLUMN audit_passed_commit TEXT",
             [],
         )?;
     }

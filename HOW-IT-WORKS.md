@@ -19,7 +19,7 @@ Streamline is a **single-binary** (a self-contained program file with no extra r
 
 1. **Governance Catalog and Vault**: Organizes documents on named **shelves** (folder-like categories such as `standards`, `runbooks`, `architecture`, `projects`, `skills`, `inbox`, and `archive`). Every document carries a **Source Passport** (a cover card showing who stewards it, when it was last verified, whether it is `verified`, `stale`, `drift`, or `unknown`, and what action is needed next).
 2. **Trio+ Project Referee**: Sizes each piece of work from `P0` (a small quick fix) up to `P4` (a full large commission), locks owner choices so workers cannot erase them, tracks every requirement through five stages (**D**esigned, **I**mplemented, **T**ested, **A**ccepted, **L**ive), and checks that the final build matches the locked plan.
-3. **Hands-Off Conveyor Helpers and Release Gate**: Prepares clean read-only inputs, checks that temporary build folders are deleted, enforces cross-family review on riskier changes, and holds every completed version at `DOC_PENDING_OWNER` (waiting for the owner to read and approve `HOW-IT-WORKS.md`) before closing out.
+3. **Hands-Off Conveyor and Release Gate**: Prepares clean read-only inputs, checks that temporary build folders are deleted, enforces cross-family review on riskier changes, holds every completed version at `DOC_PENDING_OWNER` (waiting for the owner to read and approve `HOW-IT-WORKS.md`), and holds public GitHub releases at `AUDIT_PENDING` until a clean security audit is recorded.
 
 Everything is stored in **SQLite** (a single-file database kept right on disk, with no separate database server process to maintain) and can sync two ways with an **Obsidian markdown vault** (a plain folder of `.md` text notes you can view and edit in Obsidian or any text editor).
 
@@ -45,7 +45,7 @@ public_safe_mode = true
 
 Streamline listens to both human browsers and AI assistants at the same address:
 
-- **Browser workspace (`/`)**: A dark-theme three-pane screen (left navigation, center work area, right reader/history/related/passport panel) with a pluggable status mark slot.
+- **Browser workspace (`/`)**: The Streamline workspace screen with a top navigation bar across seven views (`Home`, `My profile`, `Projects`, `Library`, `Lessons`, `Connected apps`, and `Settings`), self-hosted embedded `Bricolage Grotesque` and `Inter` fonts (`/_streamline/assets/fonts/*`), a `Calm mode` toggle that hides decorative nebula, grain, and streak artwork (`/_streamline/assets/artwork/*`), and an optional local `presence_plugin_dir` slot (`/_streamline/presence-plugin/*`) in the page header.
 - **MCP (Model Context Protocol, a standard plug letting different AI tools use the same server) endpoint (`/mcp`)**: Accepts **JSON-RPC** (structured request/response messages) over web requests, or over **stdio** (a direct text pipe when a desktop app launches `streamline mcp-stdio`).
 - **Tool API (`/api/tools/:tool_name`)** and **Skill bundle (`/downloads/streamline-skills.zip`)**: Direct HTTP endpoints for calling tools and downloading the four portable AI role guides (`streamline-director`, `streamline-worker`, `streamline-acceptor`, `streamline-vault`).
 
@@ -97,18 +97,20 @@ Every requirement row (`REQ-01`, `REQ-02`, and so on) moves step by step through
 - **`I` (Implemented)**: Built by the worker.
 - **`T` (Tested)**: Verified by automated tests or checks.
 - **`A` (Accepted)**: Reviewed by an independent checker (and for `R2+` work, must come from a different AI **model family** than the builder).
-- **`L` (Live)**: Confirmed working in real life after release approval. Any unverified live claim stays marked `UNKNOWN` instead of guessing.
+- **`L` (Live)**: Confirmed working in real life after release approval (and, for public GitHub releases, after a clean security audit). Any unverified live claim stays marked `UNKNOWN` instead of guessing.
 
-### 4. Hands-Off Building, Cleanup, Cross-Family Checking, Lessons, and `DOC_PENDING_OWNER`
+### 4. Hands-Off Building, Cleanup, Cross-Family Checking, Lessons, `DOC_PENDING_OWNER`, and `AUDIT_PENDING`
 
-To close out a Trio+ project cleanly, Streamline coordinates the **conveyor** (automated build-and-check handoff) and enforces a strict three-part release gate:
+To close out a Trio+ project cleanly, Streamline coordinates the **conveyor** (`streamline-conveyor`, which runs staged builds, cross-family checking, and cleanup checks) and enforces a strict release gate:
 
-1. **Staged Build and Cleanup Verification**: Inputs are fingerprinted with a deterministic SHA-256 manifest, work runs in an isolated folder, and `verify_cleanup_clean` checks that stray temporary build folders (`target`, `.venv`, `venv`, `node_modules`, `__pycache__`) are gone before recording `mark_project_cleanup_verified`.
+1. **Staged Build and Cleanup Verification**: Inputs are fingerprinted with a deterministic SHA-256 manifest, work runs in an isolated folder with read-only inputs, and `verify_cleanup_clean` checks that stray temporary build folders (`target`, `.venv`, `venv`, `node_modules`, `__pycache__`) are gone before recording `mark_project_cleanup_verified`.
 2. **Cross-Family Checking and Sync Report**: `check_sync` pairs locked plan requirements (`OWN` and `REQ` rows) against as-built claims. For `R2` and higher risk, `verify_cross_family` forbids the same model family from grading its own build. `save_sync_report` records the independent verdict.
 3. **Central Lessons Learned (`lessons_learned`)**: The worker records reusable findings with `record_lesson` (tagged so `bootstrap` and `query_lessons` automatically surface them to future matching jobs), or explicitly records why none applied (`record_no_new_lessons`).
-4. **Plain-English Guide and `DOC_PENDING_OWNER`**: `submit_how_it_works` checks that `HOW-IT-WORKS.md` covers all required sections, contains real plain-English prose (at least 200 characters, no code dumps over 15 lines), passes the redaction gate, and confirms both cleanup and lessons are satisfied. The project then pauses at `DOC_PENDING_OWNER` until the owner calls `approve_release`, which unlocks `L` (Live) status and syncs the vault.
-
-*(Note for early `v0.1` releases: the `streamline-conveyor` crate provides the cross-family guard, manifest hashing, and cleanup checks today, while automated subprocess/webhook dispatch runs in the next build slice.)*
+4. **Plain-English Guide and `DOC_PENDING_OWNER`**: `submit_how_it_works` checks that `HOW-IT-WORKS.md` covers all required sections, contains real plain-English prose (at least 200 characters, no code dumps over 15 lines), passes the redaction gate, and confirms both cleanup and lessons are satisfied. The project then pauses at `DOC_PENDING_OWNER` for owner review.
+5. **Owner Sign-Off and GitHub Release `AUDIT_PENDING` Gate**: When the owner signs off on `HOW-IT-WORKS.md` by calling `approve_release` (or its alias `approve_how_it_works`), Streamline checks whether the project is flagged `github_release: true`:
+   - For standard non-GitHub projects (`github_release: false`), owner sign-off moves the project straight to `DONE`, promotes accepted (`A`) requirement rows to `L` (Live), and syncs the vault.
+   - For projects marked `github_release: true` without an already recorded passing audit commit, owner sign-off moves the project to `AUDIT_PENDING` instead of closing immediately. Requirement rows stay at `A` until the security audit is recorded.
+   - Only after an independent security audit runs on that exact source commit and the owner calls `record_security_audit` with the audited commit SHA (`audited_commit`), `skill_revision`, `0` confirmed findings, and `0` needs-validation items does the project transition from `AUDIT_PENDING` to `DONE` and promote `A` rows to `L`.
 
 ## Health and Logs
 
@@ -116,18 +118,18 @@ You can check Streamline's health at any time without logging in:
 
 - **HTTP health check (`GET /ready`)**: Returns JSON showing `"ok": true`, `"status": "ready"`, the server version, whether `public_safe_mode` is active, and the current `current_rules_sha256` fingerprint.
 - **MCP / tool health check (`ready`)**: Returns the exact same status payload inside an AI session.
-- **Browser status screen (`GET /`)**: Shows active rule digest, safe mode status, and workspace state in the left sidebar and main view.
+- **Browser status screen (`GET /`)**: Shows the workspace connection state, active rule digest, safe mode status, and project review stages (`DOC_PENDING_OWNER` and `AUDIT_PENDING`) across the top navigation bar (`Home`, `My profile`, `Projects`, `Library`, `Lessons`, `Connected apps`, `Settings`) and main workspace view.
 - **Server logs**: Streamline logs structured operational events using standard terminal logging controlled by `RUST_LOG` (default `info`). In `streamline serve`, logs go to standard output; in `streamline mcp-stdio`, logs go strictly to `stderr` so they never corrupt MCP JSON messages on `stdout`. Credential contents are never logged.
-- **Audit trail (`audit_events`)**: Important actions (grant checks, rule acknowledgements, locks, sync reports, and releases) are recorded in SQLite with caller ID, target ID, and outcome.
+- **Audit trail (`audit_events`)**: Important actions (grant checks, rule acknowledgements, locks, sync reports, `HOW-IT-WORKS` sign-offs, security audit recordings, and releases) are recorded in SQLite with caller ID, target ID, and outcome.
 
 ## Failure Modes and Recovery
 
 Here are the normal safety stops you may see, why they happen, and how to recover cleanly:
 
 - **`401 UNAUTHORIZED` (Missing, Expired, or Revoked Pass)**: The caller sent no credential, a mistyped credential, or an expired/revoked grant. Fix: verify the environment variable or header holds the right credential, or issue a new grant with `streamline init-grant`.
-- **`403 FORBIDDEN` (Tag, Write, or Role Limit)**: The caller's grant lacks the required shelf tag, `can_write`, or owner role (for example, a worker trying to call `approve_release`). Fix: keep the caller scoped to its job, or update the grant if genuinely needed.
+- **`403 FORBIDDEN` (Tag, Write, or Role Limit)**: The caller's grant lacks the required shelf tag, `can_write`, or owner role (for example, a worker trying to call `approve_release`, `approve_how_it_works`, or `record_security_audit`). Fix: keep the caller scoped to its job, or have the owner perform owner-only release and audit sign-offs.
 - **`412 PRECONDITION_FAILED` / `RULES_ACK_REQUIRED`**: The caller has not acknowledged the active rules digest, or the owner updated `standards/rules` since the last session. Fix: call `bootstrap` to read the new `rules_sha256` and call `ack_rules`.
 - **`409 OWN_LOCKED` or `CONFLICT`**: Either a worker tried to overwrite a locked `OWN` decision (fix: use `record_divergence` to log a `DIV` note instead) or two edits raced on the same document revision (fix: read the latest revision and re-apply or merge cleanly).
-- **`422 REDACTION_BLOCKED`**: `streamline-safe` detected a secret-looking token, private key header, private LAN address (in public-safe mode), or disallowed dash. Zero bytes were saved. Fix: inspect the reported field and line number, remove the sensitive or disallowed text, and retry.
+- **`422 REDACTION_BLOCKED` or `UNPROCESSABLE`**: Either `streamline-safe` detected a secret-looking token, private key header, private LAN address (in public-safe mode), or disallowed dash (zero bytes saved; fix: remove the sensitive or disallowed text and retry), or `record_security_audit` rejected an invalid commit SHA, non-zero `confirmed_findings`, or non-zero `needs_validation` (fix: resolve every open finding on the audited commit before calling `record_security_audit`).
 - **`SAME_FAMILY_FORBIDDEN` or `DirtyScratch` (`conveyor`)**: Either an `R2+` acceptance check was assigned to the same AI model family that built the code (fix: assign a distinct family), or leftover temporary directories like `target` or `node_modules` remained in the workspace (fix: delete stray artifacts and re-run cleanup verification).
 - **Two-way Vault Sync Conflict**: If both the SQLite database and a `.md` file in `vault_sync_dir` changed independently, Streamline compares SHA-256 hashes rather than silently overwriting either side. Review the revision history (`resource_history`) and save or restore (`restore_resource`) the version you want.

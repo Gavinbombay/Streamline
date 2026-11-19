@@ -233,6 +233,8 @@ pub struct CreateTrioProjectRequest {
     pub initial_own_decisions: Vec<OwnDecisionInput>,
     #[serde(default)]
     pub initial_requirements: Vec<RequirementRowInput>,
+    #[serde(default)]
+    pub github_release: bool,
 }
 
 /// Trio+ project header record.
@@ -253,6 +255,10 @@ pub struct TrioProject {
     pub cleanup_verified: bool,
     #[serde(default)]
     pub lessons_satisfied: bool,
+    #[serde(default)]
+    pub github_release: bool,
+    #[serde(default)]
+    pub audit_passed_commit: Option<String>,
     pub created_at: String,
 }
 

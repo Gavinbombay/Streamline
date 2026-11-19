@@ -323,6 +323,8 @@ impl FromStr for ReqStage {
 pub enum RunPhase {
     Build,
     Accept,
+    #[serde(rename = "SECURITY_AUDIT", alias = "security_audit")]
+    SecurityAudit,
 }
 
 impl RunPhase {
@@ -330,6 +332,7 @@ impl RunPhase {
         match self {
             Self::Build => "build",
             Self::Accept => "accept",
+            Self::SecurityAudit => "SECURITY_AUDIT",
         }
     }
 }
@@ -347,6 +350,7 @@ impl FromStr for RunPhase {
         match s.trim().to_ascii_lowercase().as_str() {
             "build" => Ok(Self::Build),
             "accept" => Ok(Self::Accept),
+            "security_audit" => Ok(Self::SecurityAudit),
             _ => Err(CoreError::InvalidEnum {
                 kind: "RunPhase",
                 value: s.to_string(),
@@ -365,6 +369,7 @@ pub enum RunState {
     Scanning,
     Accepting,
     DocPendingOwner,
+    AuditPending,
     Done,
     Impasse,
     Quarantined,
@@ -379,6 +384,7 @@ impl RunState {
             Self::Scanning => "SCANNING",
             Self::Accepting => "ACCEPTING",
             Self::DocPendingOwner => "DOC_PENDING_OWNER",
+            Self::AuditPending => "AUDIT_PENDING",
             Self::Done => "DONE",
             Self::Impasse => "IMPASSE",
             Self::Quarantined => "QUARANTINED",
@@ -404,6 +410,7 @@ impl FromStr for RunState {
             "SCANNING" => Ok(Self::Scanning),
             "ACCEPTING" => Ok(Self::Accepting),
             "DOC_PENDING_OWNER" => Ok(Self::DocPendingOwner),
+            "AUDIT_PENDING" => Ok(Self::AuditPending),
             "DONE" => Ok(Self::Done),
             "IMPASSE" => Ok(Self::Impasse),
             "QUARANTINED" => Ok(Self::Quarantined),
@@ -621,4 +628,46 @@ pub enum CoreError {
     HowItWorksNotApproved,
     #[error("invalid input: {0}")]
     InvalidInput(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_state_and_phase_round_trip() {
+        assert_eq!(RunState::AuditPending.as_str(), "AUDIT_PENDING");
+        assert_eq!(RunState::AuditPending.to_string(), "AUDIT_PENDING");
+        assert_eq!(
+            "AUDIT_PENDING".parse::<RunState>().unwrap(),
+            RunState::AuditPending
+        );
+        assert_eq!(
+            "audit-pending".parse::<RunState>().unwrap(),
+            RunState::AuditPending
+        );
+        let state_json = serde_json::to_string(&RunState::AuditPending).unwrap();
+        assert_eq!(state_json, "\"AUDIT_PENDING\"");
+        assert_eq!(
+            serde_json::from_str::<RunState>(&state_json).unwrap(),
+            RunState::AuditPending
+        );
+
+        assert_eq!(RunPhase::SecurityAudit.as_str(), "SECURITY_AUDIT");
+        assert_eq!(RunPhase::SecurityAudit.to_string(), "SECURITY_AUDIT");
+        assert_eq!(
+            "SECURITY_AUDIT".parse::<RunPhase>().unwrap(),
+            RunPhase::SecurityAudit
+        );
+        assert_eq!(
+            "security_audit".parse::<RunPhase>().unwrap(),
+            RunPhase::SecurityAudit
+        );
+        let phase_json = serde_json::to_string(&RunPhase::SecurityAudit).unwrap();
+        assert_eq!(phase_json, "\"SECURITY_AUDIT\"");
+        assert_eq!(
+            serde_json::from_str::<RunPhase>(&phase_json).unwrap(),
+            RunPhase::SecurityAudit
+        );
+    }
 }
