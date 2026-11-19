@@ -1,6 +1,6 @@
 # Streamline security audit
 
-The final security audit completed on **2026-11-18** (America/St_Johns), against commit `4446b50c6a640544c4bc66cde51e227323d8db98`. It was a **full audit, all phases, standard profile**, with a complete run status, a passing final clean critic, and **zero open findings**. No confirmed, parked, or needs-validation items remained in the final Pass 11 (`r11`) findings record (`46` active coverage units covered, `0` candidate, `1` removed hook unit not applicable).
+The latest security audit completed on **2026-11-19** (America/St_Johns), against `v0.1.1` commit `de074b6660021b6fc35acbb97a2cdc5e1a7efad1` (building on the full 11-pass `v0.1.0` baseline at `4446b50c6a640544c4bc66cde51e227323d8db98`), with a complete run status, a passing independent final clean critic, and **zero open findings**. No confirmed, parked, or needs-validation items remained in the `v0.1.1` (`secaudit-v011-r1`) findings record (`47` active coverage units covered, `0` candidate, `1` removed hook unit not applicable).
 
 ## Method and provenance
 
@@ -15,7 +15,7 @@ The full review series covered the Rust workspace (`streamline-core`, `streamlin
 5. Independent record verification audited claim-to-evidence alignment before an independent final clean critic passed with zero discrepancies.
 6. Target-neutral reporting assembled `REPORT.md`, `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, and `run-metadata.json`.
 
-The retained lane packages (`secaudit-v010-r1` through `secaudit-v010-r11`) preserve reconnaissance, per-agent hunting transcripts, `coverage-ledger.json`, `findings.json`, `record-verification.md`, `REPORT.md`, and `run-metadata.json`. Unmodified `validate-findings.cjs`, `validate-coverage-ledger.cjs`, and their 65 unit self-tests exited `0`. Those internal artifacts are retained privately outside this repository; this document is their public summary.
+The retained lane packages (`secaudit-v010-r1` through `secaudit-v010-r11` and `secaudit-v011-r1`) preserve reconnaissance, per-agent hunting transcripts, `coverage-ledger.json`, `findings.json`, `record-verification.md`, `REPORT.md`, and `run-metadata.json`. Unmodified `validate-findings.cjs`, `validate-coverage-ledger.cjs`, and their 65 unit self-tests exited `0`. Those internal artifacts are retained privately outside this repository; this document is their public summary.
 
 ## How the result changed across runs
 
@@ -27,6 +27,7 @@ The retained lane packages (`secaudit-v010-r1` through `secaudit-v010-r11`) pres
 | Pass 4 (`r4`, `0838a6b34212`) | **Zero confirmed findings (`0` confirmed, `1` needs-validation).** Enforced Unix-only compilation (`compile_error!` on non-Unix), root-walked `PinnedDir` from `/` with UID and mode checks (`0o022 == 0` on `presence_plugin_dir`), uniform `404` on restricted `resource_id` and cross-project lookups, redacted `ForbiddenTag` HTTP responses, bounded output file/byte/finding caps, and `Beacon`-aligned publication docs. Only unbounded `readdir` entry materialization remained. |
 | Passes 5 to 10 (`r5`..`r10`) | **Zero confirmed findings; iterative closure of 1 remaining boundary lead per pass.** Added `list_entry_names_bounded` and `32`-level tree-depth caps (`a56b272f5e10`); rejected non-UTF-8 `dirent` names and switched output scanning to lossy UTF-8 (`da8c07cf68dc`); restricted `Live` (`L`) promotion and post-lock requirement edits to `Owner` grants (`a87274ca5238`); scanned output entry names and hashed unsafe diagnostic/escalation paths in `runner.rs` (`38afabe85def`) and `staging.rs` / `map_conveyor_error` (`397ab2ed542b`); isolated child harnesses with `Stdio::null()`, `300s` runtime timeouts, and `max_concurrency` slots (`f9452f90e6fe`). |
 | Pass 11 (`r11`, `4446b50c6a64`) | **Complete standard-profile PASS at the commit above.** `run_harness_command_with_timeout` terminates and drains the isolated Unix process group (`SIGKILL` + `ESRCH` poll) on normal exit as well as on timeout and error before output scanning runs. All `46` active units are covered, with **zero confirmed and zero needs-validation findings**. |
+| `v0.1.1` Delta (`secaudit-v011-r1`, `de074b666002`) | **Clean pass (`0` confirmed, `0` needs-validation, `CLEAN_PASS`).** Re-audited all 14 modified units and 1 new embedded font/artwork route unit across the authentic Streamline workspace UI (`ui.rs` safe DOM construction, `safeDocumentHref`, `presence_plugin_dir` boundary), compile-time static font/SVG routes (`lib.rs`), and the mechanical `HOW-IT-WORKS` -> `AUDIT_PENDING` -> `record_security_audit` release gate (`trio.rs`, `migrations.rs`, `tools.rs`), carrying forward 32 unchanged `v0.1.0` units; independent `final_clean_critic` passed with zero discrepancies. |
 
 ## Recorded verification
 
@@ -38,4 +39,4 @@ This is a static source and bounded local test review, not a live-deployment pen
 
 `cargo-audit` and `cargo-deny` were not installed on the local build host during this offline review, so RustSec advisory database and crates.io yanked-package checks were not executed in this run. Maintainers with network access should run the dependency commands in [`docs/SECURITY.md`](docs/SECURITY.md) before publishing releases.
 
-This post-audit documentation update adds `AUDIT.md`, brand images (`docs/assets/streamline-mark.png`, `docs/assets/streamline-hero.jpg`, `docs/social-preview.png`, and `docs/assets/streamline-mark.svg`), and static documentation badges only. It preserves the exact Pass 11 audited source at commit `4446b50c6a640544c4bc66cde51e227323d8db98`, and the build and security-audit badges refer to that recorded evidence rather than a live continuous integration service.
+This post-audit documentation update adds `AUDIT.md`, brand images (`docs/assets/streamline-mark.png`, `docs/assets/streamline-hero.jpg`, `docs/social-preview.png`, and `docs/assets/streamline-mark.svg`), and static documentation badges only. It preserves the exact `v0.1.1` audited source at commit `de074b6660021b6fc35acbb97a2cdc5e1a7efad1`, and the build and security-audit badges refer to that recorded evidence rather than a live continuous integration service.

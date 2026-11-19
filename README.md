@@ -5,8 +5,8 @@
 ### Your context. One enforced workflow.
 
 [![License: Apache License 2.0](docs/badges/license.svg)](LICENSE)
-[![Build: 75 passed, 0 failed at 4446b50c6a64](docs/badges/build.svg)](#build)
-[![Security audit: PASS, zero open findings at 4446b50c6a64](docs/badges/security-audit.svg)](AUDIT.md)
+[![Build: 80 passed, 0 failed at de074b666002](docs/badges/build.svg)](#build)
+[![Security audit: PASS, zero open findings at de074b666002](docs/badges/security-audit.svg)](AUDIT.md)
 
 ![Three luminous streams converging into the Streamline trefoil orb](docs/assets/streamline-hero.jpg)
 
