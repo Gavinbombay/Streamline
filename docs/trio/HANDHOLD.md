@@ -23,7 +23,7 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 
 | ID | Source | Requirement | Verification | D | I | T | A | L |
 | :--- | :--- | :--- | :--- | :-: | :-: | :-: | :-: | :-: |
-| `REQ-01` | `OWN-001` | Rust 1.98 + Axum + SQLite workspace builds cleanly offline/locked with zero Python product services | `check-toolchain.sh` + `cargo test --workspace` (`43/0`) | X | X | X | X | X |
+| `REQ-01` | `OWN-001` | Rust 1.98 + Axum + SQLite workspace builds cleanly offline/locked with zero Python product services | `check-toolchain.sh` + `cargo test --workspace` (`75/0`) | X | X | X | X | X |
 | `REQ-02` | `OWN-004` | Mechanical `bootstrap` + `ack_rules` blocks write/dispatch calls (`412`) until current rules digest is acknowledged | Integration test `ack_gate_test` + live `/mcp` | X | X | X | X | X |
 | `REQ-03` | `OWN-004` | Tag-scoped grants enforce shelf/project read & write isolation (`403` on ungranted shelves) | Integration test `tag_isolation_test` | X | X | X | X | X |
 | `REQ-04` | `OWN-004` | `streamline-safe` rejects high-entropy credentials, private LAN literals (in public-safe mode), and banned patterns (`422`) | Unit + MCP negative suite `redaction_gate_test` | X | X | X | X | X |
@@ -38,7 +38,7 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 | `REQ-13` | `OWN-004` | `/downloads/streamline-skills.zip` serves validated `director`, `worker`, `acceptor`, and `vault` skills | Archive byte & PKZIP CRC check | X | X | X | X | X |
 | `REQ-14` | `OWN-005` | 3-pane Web UI preserves exact Streamline dark palette, `16px`/`14px` floors, `44px` targets, and expanded word diffs | DOM/CSS assertion suite | X | X | X | X | X |
 | `REQ-15` | `OWN-006` | Open-source UI renders default status mark while loading private Presence canvas only when `presence_plugin_dir` is configured | Plugin mount isolation test | X | X | X | X | X |
-| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, and `AUDIT.md` PASS prior to manual owner publication | Hygiene scan `0/0/0`; `AUDIT.md` PASS verified before manual owner push to `main`; Git host protections configured on remote | X | X | X | | |
+| `REQ-16` | `OWN-002/003` | Repo ships `Apache-2.0`, `NOTICE`, `Beacon`-style README/captures/badges, zero private strings, and `AUDIT.md` PASS prior to manual owner publication | Hygiene scan `0/0/0`; `AUDIT.md` PASS (`0` open findings at `4446b50c6a64`) | X | X | X | X | X |
 | `REQ-17` | `OWN-011` | Closeout enforces verified temp cleanup (`mark_project_cleanup_verified`), forward lessons in the central `lessons_learned` DB (`record_lesson` / `query_lessons`), and plain-English non-technical `HOW-IT-WORKS.md` approval | Store + MCP closeout gate + `3` live central lessons | X | X | X | X | X |
 
 ## 3. Four-Gate Independent Acceptance (`L10`)
@@ -63,5 +63,5 @@ Each slice reaches a real end-to-end journey on the actual binary before moving 
 | `C-03` | Slice 1 | Acceptor | Connect live MCP; execute real `P1` Trio+ lifecycle, `2,933`-item legacy import, `bootstrap` fencing, central lessons, and skills zip verification | Live loopback MCP e2e (`200`, `0` temp files left) | PASS |
 | `C-04` | Slice 2 | Worker | Implement `streamline-conveyor` (read-only stage, runner, cleanup/scan gate, cross-family QC, JSONL export) | `12/12` conveyor e2e tests (`conveyor-closeout.svg`) | PASS |
 | `C-05` | Slice 3 | Worker | Implement 3-pane Web UI + `presence_plugin_dir` hook + `Beacon`-style README, captures, and `HOW-IT-WORKS.md` | `10/10` HTTP/UI tests (`mcp-policy.svg`), `streamline.service` active, `cargo clean` `2.6 GiB` freed | PASS |
-| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` + zero-hit scan to produce `AUDIT.md` PASS prior to the owner's manual GitHub push and remote branch/tag protection setup | Parked until owner performs manual publication after `AUDIT.md` passes | PARKED |
+| `C-06` | Audit | Acceptor | Run 6-phase `cloudflare/security-audit-skill` + zero-hit scan to produce `AUDIT.md` PASS prior to the owner's manual GitHub push and remote branch/tag protection setup | Pass 11 (`r11`) `CLEAN_PASS` (`0` open findings) at `4446b50c6a64` + `0/0/0` scan | PASS |
 | `C-07` | Closeout | Owner | Review plain-English `HOW-IT-WORKS.md` (`DOC-PENDING-OWNER`); later supply logo assets and decide on GitHub push | Owner approved `HOW-IT-WORKS.md` (`2026-11-18`) | PASS |

@@ -8,3 +8,4 @@
 - **Social Preview**: `docs/social-preview.png` (`1280x640` PNG under 1 MB with metadata stripped, supplied alongside `docs/assets/streamline-mark.png` and `docs/assets/streamline-hero.jpg` before going public).
 - **Author & Copyright**: `GavinBombay and Streamline contributors` (`Apache-2.0`, `LICENSE` and `NOTICE` authoritative).
 - **Publication**: Publication is the repository owner's separate manual post-landing step after the security audit (`AUDIT.md`) passes clean: push to `main` without force, make the repository public, and set the repository description, topics, and social preview manually. This repository performs no automated publishing or repository-settings actions.
+- **Badges**: Local static SVGs under `docs/badges/`; the security and build badges refer to audited and tested Pass 11 commit `4446b50c6a640544c4bc66cde51e227323d8db98` (`zero open findings; 75 passed, 0 failed`). No live continuous integration badge or workflow is implied.
