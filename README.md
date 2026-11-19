@@ -1,12 +1,14 @@
-<p align="center"><img src="docs/assets/streamline-mark.svg" alt="Streamline mark" width="88"></p>
+<p align="center"><img src="docs/assets/streamline-mark.png" alt="Streamline trefoil mark" width="88"></p>
 
 # Streamline
 
 ### Your context. One enforced workflow.
 
-[![License](docs/badges/license.svg)](LICENSE)
-[![Build](docs/badges/build.svg)](#build)
-[![Security Audit](docs/badges/security-audit.svg)](AUDIT.md)
+[![License: Apache License 2.0](docs/badges/license.svg)](LICENSE)
+[![Build: 75 passed, 0 failed at 4446b50c6a64](docs/badges/build.svg)](#build)
+[![Security audit: PASS, zero open findings at 4446b50c6a64](docs/badges/security-audit.svg)](AUDIT.md)
+
+![Three luminous streams converging into the Streamline trefoil orb](docs/assets/streamline-hero.jpg)
 
 **A Rust governance catalog, personal context store, Model Context Protocol referee, and hands-off Trio+ workflow server.**
 
