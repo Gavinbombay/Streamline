@@ -25,6 +25,6 @@ test tests::trajectory_export_refuses_intermediate_symlinked_ancestor ... ok
 test tests::trajectory_export_refuses_symlinked_target_and_runs_dir ... ok
 test tests::trajectory_export_writes_verified_jsonl_and_blocks_unsafe_text ... ok
 test tests::two_strike_builder_failure_records_impasse_and_escalation ... ok
-test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
 running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

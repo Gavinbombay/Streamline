@@ -1356,24 +1356,38 @@ pub(crate) fn run_harness_command_with_timeout(
     let mut child = cmd.spawn().map_err(|err| {
         ConveyorError::RunnerFailure(format!("failed to spawn harness '{}': {err}", harness.id))
     })?;
+    let child_pgid = child.id();
+
+    struct ProcessGroupCleanupGuard(u32);
+    impl Drop for ProcessGroupCleanupGuard {
+        fn drop(&mut self) {
+            kill_process_group(self.0);
+        }
+    }
+    let _pg_cleanup = ProcessGroupCleanupGuard(child_pgid);
 
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(HarnessExit::Exited(status)),
+            Ok(Some(status)) => {
+                kill_process_group(child_pgid);
+                return Ok(HarnessExit::Exited(status));
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    kill_process_group(child.id());
+                    kill_process_group(child_pgid);
                     let _ = child.kill();
                     let _ = child.wait();
+                    kill_process_group(child_pgid);
                     return Ok(HarnessExit::TimedOut(timeout));
                 }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
-                kill_process_group(child.id());
+                kill_process_group(child_pgid);
                 let _ = child.kill();
                 let _ = child.wait();
+                kill_process_group(child_pgid);
                 return Err(ConveyorError::RunnerFailure(format!(
                     "failed waiting on harness '{}': {err}",
                     harness.id

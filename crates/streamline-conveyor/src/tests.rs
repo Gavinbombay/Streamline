@@ -1494,4 +1494,35 @@ fn harness_discards_large_stdio_enforces_timeout_and_concurrency_cap() {
     let slot_three =
         crate::runner::acquire_harness_slot(&runs_dir.to_string_lossy(), &capped).expect("slot 3");
     drop(slot_three);
+
+    // Background descendants in the harness process group must be terminated on normal exit
+    // before output scanning or post-run stages proceed.
+    let bg_spec = tmp.path.join("bg_spec.md");
+    fs::write(&bg_spec, "Input\n").expect("write bg_spec.md");
+    let bg_builder = sh_harness(
+        "codex-bg",
+        "openai-codex",
+        "(sleep 0.25 && printf 'late\\n' > \"$STREAMLINE_OUT_DIR/late_descendant.txt\") &
+         printf 'immediate\\n' > \"$STREAMLINE_OUT_DIR/immediate.txt\"",
+    );
+    let bg_acceptor = sh_harness("agy-bg", "google-gemini", "exit 0");
+    let bg_runs_dir = tmp.path.join("runs_bg");
+    let bg_cfg = base_config(&bg_runs_dir, vec![bg_builder, bg_acceptor]);
+    let bg_req = DispatchRequest {
+        project_id: "proj-bg-descendant".to_string(),
+        input_paths: vec![bg_spec],
+        preferred_builder_harness: None,
+        preferred_acceptor_harness: None,
+        risk_band: 2,
+        caller_has_wildcard_scope: true,
+    };
+    let bg_outcome = execute_conveyor_blocking(&bg_cfg, &bg_req).expect("bg descendant run");
+    assert_eq!(bg_outcome.final_state, RunState::DocPendingOwner);
+    std::thread::sleep(Duration::from_millis(350));
+    let bg_out_dir = bg_runs_dir.join(&bg_outcome.build_run.run_id).join("out");
+    assert!(bg_out_dir.join("immediate.txt").exists());
+    assert!(
+        !bg_out_dir.join("late_descendant.txt").exists(),
+        "background process-group descendant must be killed on harness exit"
+    );
 }
