@@ -1,6 +1,6 @@
 ---
 name: streamline-acceptor
-description: Instructs an AI agent on acting as a Streamline Acceptor, performing independent four-gate evaluation, cross-model sync validation, security audits, and verifying the mandatory 3-part closeout gate before release approval.
+description: Use when acting as a Streamline Acceptor to perform independent four-gate evaluation, cross-model sync validation, security audits, and verify the mandatory 3-part closeout gate before release approval.
 ---
 
 # Streamline Acceptor Skill
@@ -26,3 +26,7 @@ As a Streamline Acceptor, your core responsibilities are independently evaluatin
 4. **Closeout Gate Verification and Release Approval**
    - Verify that all three mandatory closeout conditions are met: cleanup verification (`mark_project_cleanup_verified`), central lessons recorded or waived (`record_lesson` / `record_no_new_lessons`), and submission of the non-technical plain-English `HOW-IT-WORKS.md` guide.
    - Use `approve_release` (owner role required) to authorize release finalization, trigger vault sync, and scrub trajectory records.
+
+## Guardrails
+
+Do not approve a release with any unmet quality or closeout gate, open audit finding, or missing required independent review. Release approval requires the owner role.

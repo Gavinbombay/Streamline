@@ -45,8 +45,9 @@ pub struct ReadyStatus {
     pub current_rules_sha256: String,
 }
 
-pub const KNOWN_TOOLS: [&str; 44] = [
+pub const KNOWN_TOOLS: [&str; 45] = [
     "ready",
+    "ecosystem_brief",
     "bootstrap",
     "ack_rules",
     "get_workspace",
@@ -109,13 +110,18 @@ pub fn compute_ready_status(state: &AppState) -> Result<ReadyStatus, ApiError> {
     })
 }
 
-/// Returns MCP `tools/list` metadata and JSON Schemas for all 44 tools.
+/// Returns MCP `tools/list` metadata and JSON Schemas for all 45 tools.
 pub fn tools_list() -> Vec<McpToolDescriptor> {
     vec![
         McpToolDescriptor {
             name: "ready",
             description: "Return server readiness, version, public_safe_mode, and current_rules_sha256.",
             input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        McpToolDescriptor {
+            name: "ecosystem_brief",
+            description: "Read live Diffuser fleet health, nightly backup status, failed systemd unit count, root filesystem usage, and ecosystem status file metadata. Unavailable sources return null fields; no writes or rule acknowledgement required. If another collection is in progress, retry later.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         McpToolDescriptor {
             name: "bootstrap",
@@ -706,6 +712,30 @@ pub fn dispatch_tool(
 ) -> Result<Value, ApiError> {
     match tool_name {
         "ready" => Ok(serde_json::to_value(compute_ready_status(state)?)?),
+        "ecosystem_brief" => {
+            require_grant(grant)?;
+            if normalize_args(raw_args) != json!({}) {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "UNPROCESSABLE",
+                    "ecosystem_brief takes no arguments",
+                ));
+            }
+            // Do not queue blocking workers behind a running probe collection.
+            // Hold the permit until collection finishes, even if the client disconnects.
+            let _permit = state.ecosystem_brief_slots.try_acquire().map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ECOSYSTEM_BRIEF_BUSY",
+                    "ecosystem_brief collection already in progress; retry later",
+                )
+            })?;
+            #[cfg(test)]
+            if let Some(collect) = state.ecosystem_brief_override {
+                return Ok(collect());
+            }
+            Ok(crate::ecosystem::collect())
+        }
         "bootstrap" => {
             let active_grant = require_grant(grant)?;
             let view = state.store.bootstrap_view(&active_grant.grant_id)?;
@@ -1366,7 +1396,9 @@ pub fn dispatch_tool(
                     "vault_sync_dir is not configured",
                 ));
             }
-            let summary = state.store.sync_vault_dir(Path::new(vault_dir))?;
+            let summary = state
+                .store
+                .sync_vault_dir_as_owner(Path::new(vault_dir), &checked.grant_id)?;
             Ok(serde_json::to_value(summary)?)
         }
         "export_workspace" => {
@@ -1723,7 +1755,7 @@ fn post_release_exports(
 ) {
     let vault_dir = state.config.vault_sync_dir.trim();
     if !vault_dir.is_empty() {
-        if let Err(err) = state.store.sync_vault_dir(Path::new(vault_dir)) {
+        if let Err(err) = state.store.export_vault_dir(Path::new(vault_dir)) {
             tracing::warn!(error = %err, action = action_label, "best-effort vault sync skipped");
         }
     }

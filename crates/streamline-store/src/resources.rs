@@ -9,6 +9,10 @@ use crate::grants::{
     missing_tag_for_scope, now_rfc3339, record_audit_tx, require_rules_acked_tx, sha256_hex,
 };
 use crate::lessons::load_lessons_tx;
+use crate::limits::{
+    Budget, MAX_RESOURCE_BODY_BYTES, MAX_RESOURCE_METADATA_BYTES, MAX_RESULT_BYTES,
+    MAX_RESULT_ROWS, MAX_VAULT_BYTES,
+};
 use crate::models::{
     AccessGrant, BootstrapView, DiffLine, ResourceFilter, ResourceRecord, ResourceRevision,
     ResourceSearchHit, ResourceWithPassport, RevisionDiffSummary, SaveResourceRequest,
@@ -88,6 +92,22 @@ pub(crate) fn save_resource_tx(
     grant: Option<&AccessGrant>,
     req: SaveResourceRequest,
 ) -> Result<ResourceWithPassport, StoreError> {
+    if req.body_md.len() > MAX_RESOURCE_BODY_BYTES {
+        return Err(StoreError::InvalidInput(
+            "resource body exceeds 16 MiB".into(),
+        ));
+    }
+    let metadata_bytes = req.shelf_slug.len()
+        + req.slug.len()
+        + req.title.len()
+        + req.summary.len()
+        + req.project_id.as_ref().map_or(0, String::len)
+        + req.trio_role.as_ref().map_or(0, String::len);
+    if metadata_bytes > MAX_RESOURCE_METADATA_BYTES {
+        return Err(StoreError::InvalidInput(
+            "resource metadata exceeds 64 KiB".into(),
+        ));
+    }
     let shelf_slug = validate_slug(&req.shelf_slug, "shelf_slug")?;
     let slug = validate_slug(&req.slug, "slug")?;
     let dest_project_id = match req.project_id {
@@ -166,7 +186,7 @@ pub(crate) fn save_resource_tx(
                     )));
                 }
             }
-            let next_rev = prev.current_rev + 1;
+            let next_rev = crate::limits::next_revision(prev.current_rev)?;
             let next_tier = req.lifecycle_tier.unwrap_or(prev.lifecycle_tier);
             let next_triage = req.triage_state.unwrap_or(prev.triage_state);
             let next_project = dest_project_id.or(prev.project_id);
@@ -541,6 +561,7 @@ impl StreamlineStore {
         let rules_sha256 = current_rules_sha256_tx(&conn)?;
         let rules_acked = grant.acked_rules_sha256.as_deref() == Some(rules_sha256.as_str());
 
+        let mut budget = Budget::new("bootstrap", MAX_RESULT_BYTES);
         let mut active_resources = Vec::new();
         {
             let mut stmt = conn.prepare(
@@ -560,7 +581,7 @@ impl StreamlineStore {
             for item in rows {
                 let (res, req_tag) = item?;
                 if can_read_resource_row(&grant, &req_tag, &res) {
-                    active_resources.push(res);
+                    budget.push(&mut active_resources, res)?;
                 }
             }
         }
@@ -590,7 +611,7 @@ impl StreamlineStore {
             for item in rows {
                 let proj = item?;
                 if grant_has_tag_access(&grant, "projects", "projects", Some(&proj.project_id)) {
-                    active_projects.push(proj);
+                    budget.push(&mut active_projects, proj)?;
                 }
             }
         }
@@ -785,10 +806,11 @@ impl StreamlineStore {
         })?;
 
         let mut out = Vec::new();
+        let mut budget = Budget::new("resource list", MAX_RESULT_BYTES);
         for item in rows {
             let (res, req_tag) = item?;
             if can_read_resource_row(&grant, &req_tag, &res) {
-                out.push(res);
+                budget.push(&mut out, res)?;
             }
         }
         Ok(out)
@@ -850,23 +872,29 @@ impl StreamlineStore {
         let resources = self.list_resources(grant_id, filter)?;
         let conn = self.lock_conn()?;
         let mut hits = Vec::new();
+        let mut scan_budget = Budget::new("resource search scan", MAX_VAULT_BYTES);
+        let mut result_budget = Budget::new("resource search results", MAX_RESULT_BYTES);
         for res in resources {
             let body_md: String = conn.query_row(
                 "SELECT body_md FROM resource_revisions WHERE resource_id = ?1 AND rev = ?2",
                 params![res.id, res.current_rev],
                 |row| row.get(0),
             )?;
+            scan_budget.add(body_md.len())?;
             let matches = res.title.to_ascii_lowercase().contains(&needle)
                 || res.slug.to_ascii_lowercase().contains(&needle)
                 || body_md.to_ascii_lowercase().contains(&needle);
             if matches {
                 let passport = load_passport_tx(&conn, &res.id)?;
                 let snippet = build_snippet(&body_md, &needle);
-                hits.push(ResourceSearchHit {
-                    resource: res,
-                    snippet,
-                    passport,
-                });
+                result_budget.push(
+                    &mut hits,
+                    ResourceSearchHit {
+                        resource: res,
+                        snippet,
+                        passport,
+                    },
+                )?;
             }
         }
         Ok(hits)
@@ -931,8 +959,9 @@ impl StreamlineStore {
         })?;
 
         let mut history = Vec::new();
+        let mut budget = Budget::new("resource history", MAX_RESULT_BYTES);
         for item in rows {
-            history.push(item?);
+            budget.push(&mut history, item?)?;
         }
         Ok(history)
     }
@@ -1201,7 +1230,7 @@ impl StreamlineStore {
             "SELECT event_id, principal_id, action, target_id, outcome, detail_json, created_at
              FROM audit_events ORDER BY created_at DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map(params![limit.min(MAX_RESULT_ROWS) as i64], |row| {
             Ok(AuditEvent {
                 event_id: row.get(0)?,
                 principal_id: row.get(1)?,
@@ -1213,8 +1242,9 @@ impl StreamlineStore {
             })
         })?;
         let mut events = Vec::new();
+        let mut budget = Budget::new("audit events", MAX_RESULT_BYTES);
         for item in rows {
-            events.push(item?);
+            budget.push(&mut events, item?)?;
         }
         Ok(events)
     }
@@ -1224,6 +1254,7 @@ impl StreamlineStore {
         conn: &Connection,
     ) -> Result<BTreeMap<(String, String), ResourceWithPassport>, StoreError> {
         let mut map = BTreeMap::new();
+        let mut budget = Budget::new("vault database corpus", MAX_VAULT_BYTES);
         let mut stmt = conn.prepare(
             "SELECT r.id, r.shelf_slug, r.slug, r.project_id, r.trio_role, r.lifecycle_tier,
                     r.triage_state, r.title, r.current_rev, r.current_sha256, r.deleted_at,
@@ -1242,13 +1273,15 @@ impl StreamlineStore {
         for item in rows {
             let (res, body_md) = item?;
             let passport = load_passport_tx(conn, &res.id)?;
+            let item = ResourceWithPassport {
+                resource: res,
+                body_md,
+                passport,
+            };
+            budget.add(crate::limits::serialized_len(&item)?)?;
             map.insert(
-                (res.shelf_slug.clone(), res.slug.clone()),
-                ResourceWithPassport {
-                    resource: res,
-                    body_md,
-                    passport,
-                },
+                (item.resource.shelf_slug.clone(), item.resource.slug.clone()),
+                item,
             );
         }
         Ok(map)

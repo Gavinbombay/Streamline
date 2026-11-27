@@ -5,6 +5,9 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use crate::tools;
 
+/// Maximum number of entries (including notifications) in one MCP batch.
+pub(crate) const MAX_MCP_BATCH_ITEMS: usize = 16;
+
 fn jsonrpc_ok(id: Value, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -206,6 +209,14 @@ pub fn handle_mcp_jsonrpc(
                 Value::Null,
                 -32600,
                 "Invalid Request: empty batch",
+            ));
+        }
+        // Reject the entire batch before dispatching any item, including writes.
+        if items.len() > MAX_MCP_BATCH_ITEMS {
+            return Some(jsonrpc_error(
+                Value::Null,
+                -32600,
+                format!("Invalid Request: batch exceeds {MAX_MCP_BATCH_ITEMS} items"),
             ));
         }
         let mut responses = Vec::new();

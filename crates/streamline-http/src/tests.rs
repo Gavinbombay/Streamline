@@ -928,6 +928,61 @@ fn stdio_mcp_dispatcher_supports_param_credential_and_notifications() {
 }
 
 #[tokio::test]
+async fn mcp_batch_limit_preserves_valid_batches_and_rejects_oversized_batches() {
+    use crate::mcp::MAX_MCP_BATCH_ITEMS;
+
+    let state = make_test_state(StreamlineConfig::default());
+    let app = build_router(state.clone());
+    let notification = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+    let mut items = vec![notification.clone(); MAX_MCP_BATCH_ITEMS];
+    items[0] = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    items[MAX_MCP_BATCH_ITEMS - 1] = json!({"jsonrpc":"2.0","id":2,"method":"ping"});
+    let expected = json!([
+        {"jsonrpc":"2.0","id":1,"result":{}},
+        {"jsonrpc":"2.0","id":2,"result":{}}
+    ]);
+    assert_eq!(
+        handle_mcp_jsonrpc(&state, None, true, json!(items)),
+        Some(expected)
+    );
+    assert!(handle_mcp_jsonrpc(
+        &state,
+        None,
+        true,
+        json!(vec![notification.clone(); MAX_MCP_BATCH_ITEMS])
+    )
+    .is_none());
+
+    items.push(notification.clone());
+    let expected_error = json!({
+        "jsonrpc":"2.0", "id":null,
+        "error":{"code":-32600,"message":"Invalid Request: batch exceeds 16 items"}
+    });
+    assert_eq!(
+        handle_mcp_jsonrpc(&state, None, true, json!(items)),
+        Some(expected_error.clone())
+    );
+    assert_eq!(
+        handle_mcp_jsonrpc(
+            &state,
+            None,
+            true,
+            json!(vec![notification; MAX_MCP_BATCH_ITEMS + 1])
+        ),
+        Some(expected_error.clone())
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!(items).to_string()))
+        .unwrap();
+    let (status, response) = read_json_body(app.oneshot(request).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response, expected_error);
+}
+
+#[tokio::test]
 async fn conveyor_dispatch_and_trajectory_export_over_mcp() {
     let temp = TempDirGuard::new("streamline-conveyor-mcp");
     let runs_dir = temp.path.join("runs");
@@ -2683,4 +2738,97 @@ async fn http_github_release_audit_gate_enforces_owner_403_validation_422_and_do
         "4446b50c6a640544c4bc66cde51e227323d8db98"
     );
     assert_eq!(clean_json["data"]["requirements"][0]["stage"], "L");
+}
+
+#[tokio::test]
+async fn ecosystem_brief_requires_auth_but_not_write_permission_or_rule_ack() {
+    let mut state = make_test_state(StreamlineConfig::default());
+    state.ecosystem_brief_override =
+        Some(|| json!({"fleet":{"available":false,"workers_total":null}}));
+    state
+        .store
+        .upsert_principal("brief-reader", "brief-reader", PrincipalRole::Agent)
+        .unwrap();
+    let credential = "fixture-brief-read-only";
+    let grant = state
+        .store
+        .create_grant(CreateGrantRequest {
+            grant_id: Some("brief-reader-grant".into()),
+            principal_id: "brief-reader".into(),
+            raw_credential: credential.into(),
+            granted_tags: vec![],
+            can_write: false,
+            can_dispatch: false,
+            expires_at: None,
+            model_family: None,
+        })
+        .unwrap();
+    assert!(grant.acked_rules_sha256.is_none());
+    let audit_before = state.store.list_audit_events(100).unwrap().len();
+    let app = build_router(state.clone());
+    let response = mcp_call(&app, None, 1, "ecosystem_brief", json!({})).await;
+    assert_eq!(response["result"]["structuredContent"]["status"], 401);
+    let response = mcp_call(&app, Some(credential), 2, "ecosystem_brief", json!({})).await;
+    let (is_error, envelope) = parse_mcp_tool_text(&response);
+    assert!(!is_error);
+    assert_eq!(envelope, response["result"]["structuredContent"]);
+    assert_eq!(envelope["data"]["fleet"]["available"], false);
+    let response = mcp_call(
+        &app,
+        Some(credential),
+        3,
+        "ecosystem_brief",
+        json!({"url":"fixture-invalid"}),
+    )
+    .await;
+    assert_eq!(response["result"]["structuredContent"]["status"], 422);
+    let response = handle_mcp_jsonrpc(&state, None, true, json!({"id":4,"method":"tools/call","params":{"name":"ecosystem_brief","arguments":{"credential":credential}}})).unwrap();
+    assert!(!parse_mcp_tool_text(&response).0);
+    assert_eq!(
+        state.store.list_audit_events(100).unwrap().len(),
+        audit_before
+    );
+    assert!(state
+        .store
+        .get_grant(&grant.grant_id)
+        .unwrap()
+        .acked_rules_sha256
+        .is_none());
+}
+
+#[tokio::test]
+async fn ecosystem_brief_busy_is_shared_across_transports_and_releases_for_retry() {
+    let mut state = make_test_state(StreamlineConfig::default());
+    state.ecosystem_brief_override = Some(|| json!({"fixture":true}));
+    let credential = "fixture-brief-busy";
+    seed_grant(
+        &state.store,
+        "brief-busy-reader",
+        PrincipalRole::Agent,
+        credential,
+        vec![],
+    );
+    let app = build_router(state.clone());
+
+    // Model an in-flight collection without executing any host probes.
+    let permit = state.ecosystem_brief_slots.try_acquire().unwrap();
+    let response = mcp_call(&app, Some(credential), 1, "ecosystem_brief", json!({})).await;
+    let (is_error, envelope) = parse_mcp_tool_text(&response);
+    assert!(is_error);
+    assert_eq!(envelope["status"], 503);
+    assert_eq!(envelope["error"]["code"], "ECOSYSTEM_BRIEF_BUSY");
+    let (status, envelope) = rest_call(&app, Some(credential), "ecosystem_brief", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(envelope["error"]["code"], "ECOSYSTEM_BRIEF_BUSY");
+    let response = mcp_call(&app, None, 2, "ecosystem_brief", json!({})).await;
+    assert_eq!(response["result"]["structuredContent"]["status"], 401);
+
+    drop(permit);
+    let response = mcp_call(&app, Some(credential), 3, "ecosystem_brief", json!({})).await;
+    let (is_error, envelope) = parse_mcp_tool_text(&response);
+    assert!(!is_error);
+    assert_eq!(envelope["data"], json!({"fixture":true}));
+    let (status, envelope) = rest_call(&app, Some(credential), "ecosystem_brief", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(envelope["data"], json!({"fixture":true}));
 }

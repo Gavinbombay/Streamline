@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::Connection;
-use streamline_core::{LifecycleTier, TriageState};
+use streamline_core::{LifecycleTier, PrincipalRole, TriageState};
 use streamline_safe::PinnedDir;
 
 use crate::error::StoreError;
-use crate::grants::{now_rfc3339, record_audit_tx, sha256_hex};
+use crate::grants::{
+    check_shelf_access_tx, now_rfc3339, record_audit_tx, require_rules_acked_tx, sha256_hex,
+};
 use crate::lessons::load_all_lessons_tx;
+use crate::limits::{Budget, MAX_RESOURCE_BODY_BYTES, MAX_VAULT_BYTES};
 use crate::models::{
     LessonRecord, ResourceRecord, ResourceWithPassport, SaveResourceRequest, VaultConflictRecord,
     VaultSyncSummary,
@@ -95,7 +98,7 @@ fn parse_vault_markdown(raw: &str) -> (ParsedVaultFrontmatter, String) {
 
 fn format_vault_markdown(resource: &ResourceRecord, body_md: &str) -> Result<String, StoreError> {
     let quoted_title = serde_json::to_string(&resource.title)?;
-    Ok(format!(
+    let rendered = format!(
         "---\nslug: {}\ntitle: {}\nshelf: {}\nlifecycle_tier: {}\nrev: {}\nbase_sha256: {}\n---\n{}",
         resource.slug,
         quoted_title,
@@ -104,7 +107,13 @@ fn format_vault_markdown(resource: &ResourceRecord, body_md: &str) -> Result<Str
         resource.current_rev,
         resource.current_sha256,
         body_md
-    ))
+    );
+    if rendered.len() > MAX_RESOURCE_BODY_BYTES {
+        return Err(StoreError::InvalidInput(
+            "rendered vault file exceeds 16 MiB".into(),
+        ));
+    }
+    Ok(rendered)
 }
 
 fn format_lesson_markdown(lesson: &LessonRecord) -> Result<String, StoreError> {
@@ -233,11 +242,50 @@ impl StreamlineStore {
     ///   without overwriting either copy.
     /// - Refuses symlinks anywhere inside `vault_dir` via descriptor-pinned `PinnedDir`
     ///   (`openat`/`O_NOFOLLOW`/`renameat`).
+    /// Trusted local operator entrypoint, not for authenticated remote requests.
     pub fn sync_vault_dir(&self, vault_dir: &Path) -> Result<VaultSyncSummary, StoreError> {
-        let vault_fd = PinnedDir::open_or_create_dir(vault_dir).map_err(map_vault_io)?;
+        self.sync_vault(vault_dir, None, true)
+    }
 
+    /// Two-way sync requested by an authenticated owner. Grant checks happen in the
+    /// same transaction as imports; the local operator CLI uses sync_vault_dir instead.
+    pub fn sync_vault_dir_as_owner(
+        &self,
+        vault_dir: &Path,
+        grant_id: &str,
+    ) -> Result<VaultSyncSummary, StoreError> {
+        self.sync_vault(vault_dir, Some(grant_id), true)
+    }
+
+    /// Automatic release exports must never import disk changes or create conflict rows.
+    /// Preserve local edits and unknown files for an explicit two-way sync.
+    pub fn export_vault_dir(&self, vault_dir: &Path) -> Result<VaultSyncSummary, StoreError> {
+        self.sync_vault(vault_dir, None, false)
+    }
+
+    fn sync_vault(
+        &self,
+        vault_dir: &Path,
+        grant_id: Option<&str>,
+        allow_import: bool,
+    ) -> Result<VaultSyncSummary, StoreError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
+        let grant = grant_id
+            .map(|id| require_rules_acked_tx(&tx, id))
+            .transpose()?;
+        if let Some(ref grant) = grant {
+            if grant.principal_role != PrincipalRole::Owner {
+                return Err(StoreError::ForbiddenRole(grant.principal_role.to_string()));
+            }
+            if !grant.can_write {
+                return Err(StoreError::ForbiddenWrite);
+            }
+        }
+        let author = grant
+            .as_ref()
+            .map_or("vault-sync", |grant| grant.principal_id.as_str());
+        let vault_fd = PinnedDir::open_or_create_dir(vault_dir).map_err(map_vault_io)?;
 
         let shelf_slugs = load_shelf_slugs_tx(&tx)?;
         let db_items = Self::load_all_non_deleted_with_bodies(&tx)?;
@@ -249,6 +297,8 @@ impl StreamlineStore {
             conflicts: Vec::new(),
         };
         let mut seen_on_disk: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut disk_budget = Budget::new("vault disk corpus", MAX_VAULT_BYTES);
+        let mut pending_budget = Budget::new("vault conflict corpus", MAX_VAULT_BYTES);
         let mut pending_exports: BTreeMap<(String, String), ResourceWithPassport> = BTreeMap::new();
 
         for shelf_slug in &shelf_slugs {
@@ -276,6 +326,7 @@ impl StreamlineStore {
                 let raw_disk = shelf_fd
                     .read_to_string_nofollow(&entry_name)
                     .map_err(map_vault_io)?;
+                disk_budget.add(raw_disk.len())?;
                 let (fm, disk_body) = parse_vault_markdown(&raw_disk);
                 let Some(slug) = fm
                     .slug
@@ -317,12 +368,12 @@ impl StreamlineStore {
                                 .map_err(map_vault_io)?;
                         }
                         summary.unchanged += 1;
-                    } else if fm.base_sha256.as_deref() == Some(db_sha.as_str()) {
+                    } else if allow_import && fm.base_sha256.as_deref() == Some(db_sha.as_str()) {
                         let title = fm.title.unwrap_or_else(|| db_item.resource.title.clone());
                         let saved = save_resource_tx(
                             &tx,
-                            "vault-sync",
-                            None,
+                            author,
+                            grant.as_ref(),
                             SaveResourceRequest {
                                 shelf_slug: effective_shelf.clone(),
                                 slug: slug.clone(),
@@ -349,7 +400,15 @@ impl StreamlineStore {
                             .atomic_write_nofollow(&entry_name, rendered.as_bytes(), 0o644)
                             .map_err(map_vault_io)?;
                         summary.exported += 1;
-                    } else {
+                    } else if allow_import {
+                        if let Some(ref grant) = grant {
+                            check_shelf_access_tx(
+                                &tx,
+                                grant,
+                                &effective_shelf,
+                                db_item.resource.project_id.as_deref(),
+                            )?;
+                        }
                         let conflict_slug = format!(
                             "conflict-{}-{}-r{}-{}",
                             effective_shelf,
@@ -367,36 +426,38 @@ impl StreamlineStore {
                             &now,
                         );
                         let conflict_coord = ("inbox".to_string(), conflict_slug.clone());
-                        let conflict_resource_id =
-                            if let Some(existing_conflict) = db_items.get(&conflict_coord) {
-                                existing_conflict.resource.id.clone()
-                            } else {
-                                let saved_conflict = save_resource_tx(
-                                    &tx,
-                                    "vault-sync",
-                                    None,
-                                    SaveResourceRequest {
-                                        shelf_slug: "inbox".to_string(),
-                                        slug: conflict_slug.clone(),
-                                        title: format!("Sync Conflict: {effective_shelf}/{slug}"),
-                                        body_md: conflict_body,
-                                        project_id: db_item.resource.project_id.clone(),
-                                        trio_role: None,
-                                        lifecycle_tier: Some(LifecycleTier::Active),
-                                        triage_state: Some(TriageState::NeedsTriage),
-                                        summary: format!(
-                                            "Concurrent vault conflict on {effective_shelf}/{slug}"
-                                        ),
-                                        expected_rev: None,
-                                    },
-                                )?;
-                                pending_exports.insert(conflict_coord, saved_conflict.clone());
-                                saved_conflict.resource.id
-                            };
+                        let conflict_resource_id = if let Some(existing_conflict) =
+                            db_items.get(&conflict_coord)
+                        {
+                            existing_conflict.resource.id.clone()
+                        } else {
+                            let saved_conflict = save_resource_tx(
+                                &tx,
+                                author,
+                                grant.as_ref(),
+                                SaveResourceRequest {
+                                    shelf_slug: "inbox".to_string(),
+                                    slug: conflict_slug.clone(),
+                                    title: format!("Sync Conflict: {effective_shelf}/{slug}"),
+                                    body_md: conflict_body,
+                                    project_id: db_item.resource.project_id.clone(),
+                                    trio_role: None,
+                                    lifecycle_tier: Some(LifecycleTier::Active),
+                                    triage_state: Some(TriageState::NeedsTriage),
+                                    summary: format!(
+                                        "Concurrent vault conflict on {effective_shelf}/{slug}"
+                                    ),
+                                    expected_rev: None,
+                                },
+                            )?;
+                            pending_budget.add(crate::limits::serialized_len(&saved_conflict)?)?;
+                            pending_exports.insert(conflict_coord, saved_conflict.clone());
+                            saved_conflict.resource.id
+                        };
 
                         record_audit_tx(
                             &tx,
-                            "vault-sync",
+                            author,
                             "vault_conflict",
                             &db_item.resource.id,
                             "conflict",
@@ -419,14 +480,14 @@ impl StreamlineStore {
                             disk_sha256,
                         });
                     }
-                } else {
+                } else if allow_import {
                     let title = fm
                         .title
                         .unwrap_or_else(|| infer_title_from_body(&disk_body, &slug));
                     let saved = save_resource_tx(
                         &tx,
-                        "vault-sync",
-                        None,
+                        author,
+                        grant.as_ref(),
                         SaveResourceRequest {
                             shelf_slug: effective_shelf,
                             slug,
@@ -493,9 +554,17 @@ impl StreamlineStore {
                 let safe_id = validate_slug(&lesson.lesson_id, "lesson_id")?;
                 let file_name = format!("{safe_id}.md");
                 let rendered = format_lesson_markdown(&lesson)?;
+                if rendered.len() > MAX_RESOURCE_BODY_BYTES {
+                    return Err(StoreError::InvalidInput(
+                        "rendered vault lesson exceeds 16 MiB".into(),
+                    ));
+                }
                 let existing_matches = match lessons_fd.is_regular_file_nofollow(&file_name) {
                     Ok(true) => match lessons_fd.read_to_string_nofollow(&file_name) {
-                        Ok(existing_text) => existing_text == rendered,
+                        Ok(existing_text) => {
+                            disk_budget.add(existing_text.len())?;
+                            existing_text == rendered
+                        }
                         Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
                             return Err(map_vault_io(err));
                         }

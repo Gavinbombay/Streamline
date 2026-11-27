@@ -1,6 +1,6 @@
 ---
 name: streamline-worker
-description: Instructs an AI agent on acting as a Streamline Worker, performing lesson querying, rule acknowledgement, implementation, testing, and fulfilling the mandatory 3-part version closeout gate.
+description: Use when acting as a Streamline Worker to query lessons, acknowledge rules, implement and test assigned work, and fulfill the mandatory 3-part version closeout gate.
 ---
 
 # Streamline Worker Skill

@@ -2,6 +2,7 @@ pub mod error;
 pub mod grants;
 pub mod legacy;
 pub mod lessons;
+mod limits;
 pub mod migrations;
 pub mod models;
 pub mod resources;
@@ -42,6 +43,7 @@ impl StreamlineStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        limits::limit_database(&conn, limits::MAX_DATABASE_BYTES)?;
         migrations::run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -53,6 +55,7 @@ impl StreamlineStore {
         let mut conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        limits::limit_database(&conn, limits::MAX_DATABASE_BYTES)?;
         migrations::run_migrations(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -605,6 +608,179 @@ Unacknowledged writes return 412, locked OWN edits return 409, and SQLite backup
             .expect("owner approve release");
         assert_eq!(released.project.state, RunState::Done);
         assert_eq!(released.requirements[0].stage, ReqStage::L);
+    }
+
+    #[test]
+    fn resource_write_limits_keep_history_and_audit_intact() {
+        let store = StreamlineStore::open_in_memory().unwrap();
+        let owner = seed_owner_grant(&store);
+        store
+            .ack_rules(&owner.grant_id, &store.current_rules_sha256().unwrap())
+            .unwrap();
+        let mut req = SaveResourceRequest {
+            shelf_slug: "architecture".into(),
+            slug: "bounded".into(),
+            title: "Bounded".into(),
+            body_md: "normal body".into(),
+            project_id: None,
+            trio_role: None,
+            lifecycle_tier: None,
+            triage_state: None,
+            summary: "initial".into(),
+            expected_rev: Some(0),
+        };
+        let saved = store.save_resource(&owner.grant_id, req.clone()).unwrap();
+        let before = store.list_audit_events(100).unwrap().len();
+        req.expected_rev = Some(1);
+        req.body_md = "x".repeat(crate::limits::MAX_RESOURCE_BODY_BYTES + 1);
+        assert!(matches!(
+            store.save_resource(&owner.grant_id, req.clone()),
+            Err(StoreError::InvalidInput(_))
+        ));
+        req.body_md = "normal edit".into();
+        req.summary = "x".repeat(crate::limits::MAX_RESOURCE_METADATA_BYTES);
+        assert!(matches!(
+            store.save_resource(&owner.grant_id, req.clone()),
+            Err(StoreError::InvalidInput(_))
+        ));
+        assert_eq!(store.list_audit_events(100).unwrap().len(), before);
+        assert_eq!(
+            store
+                .resource_history(&owner.grant_id, "architecture", "bounded")
+                .unwrap()
+                .len(),
+            1
+        );
+        req.summary = "normal edit".into();
+        let next = store.save_resource(&owner.grant_id, req).unwrap();
+        assert_eq!(next.resource.id, saved.resource.id);
+        assert_eq!(next.resource.current_rev, 2);
+        assert_eq!(
+            store
+                .resource_history(&owner.grant_id, "architecture", "bounded")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn audit_event_size_limit_keeps_existing_records() {
+        let store = StreamlineStore::open_in_memory().unwrap();
+        let before = store.list_audit_events(100).unwrap().len();
+        {
+            let conn = store.lock_conn().unwrap();
+            grants::record_audit_tx(
+                &conn,
+                "test",
+                "test",
+                "test",
+                "ok",
+                serde_json::json!({ "note": "normal" }),
+            )
+            .unwrap();
+            assert!(matches!(
+                grants::record_audit_tx(
+                    &conn,
+                    "test",
+                    "test",
+                    "test",
+                    "ok",
+                    serde_json::json!({ "note": "x".repeat(crate::limits::MAX_AUDIT_EVENT_BYTES) })
+                ),
+                Err(StoreError::InvalidInput(_))
+            ));
+        }
+        assert_eq!(store.list_audit_events(100).unwrap().len(), before + 1);
+    }
+
+    #[test]
+    fn automatic_vault_export_leaves_local_edits_for_explicit_owner_sync() {
+        let dir = TempDirGuard::new("streamline-vault-export-test");
+        let store = StreamlineStore::open_in_memory().unwrap();
+        let owner = seed_owner_grant(&store);
+        let agent = seed_agent_grant(&store, "agent", "dummy-agent", vec!["*".into()]);
+        let rules = store.current_rules_sha256().unwrap();
+        store.ack_rules(&agent.grant_id, &rules).unwrap();
+        assert!(matches!(
+            store.sync_vault_dir_as_owner(&dir.path, &agent.grant_id),
+            Err(StoreError::ForbiddenRole(_))
+        ));
+        assert!(matches!(
+            store.sync_vault_dir_as_owner(&dir.path, &owner.grant_id),
+            Err(StoreError::RulesAckRequired { .. })
+        ));
+        store.ack_rules(&owner.grant_id, &rules).unwrap();
+        store
+            .save_resource(
+                &owner.grant_id,
+                SaveResourceRequest {
+                    shelf_slug: "architecture".into(),
+                    slug: "notes".into(),
+                    title: "Notes".into(),
+                    body_md: "original notes".into(),
+                    project_id: None,
+                    trio_role: None,
+                    lifecycle_tier: None,
+                    triage_state: None,
+                    summary: "initial".into(),
+                    expected_rev: None,
+                },
+            )
+            .unwrap();
+        store.export_vault_dir(&dir.path).unwrap();
+        let notes = dir.path.join("architecture/notes.md");
+        let new_file = dir.path.join("architecture/new.md");
+        let changed = fs::read_to_string(&notes)
+            .unwrap()
+            .replace("original notes", "edited notes");
+        fs::write(&notes, &changed).unwrap();
+        fs::write(&new_file, "# New notes\n").unwrap();
+        let audit_before = store.list_audit_events(100).unwrap().len();
+        let summary = store.export_vault_dir(&dir.path).unwrap();
+        assert_eq!(summary.imported, 0);
+        assert!(summary.conflicts.is_empty());
+        assert_eq!(store.list_audit_events(100).unwrap().len(), audit_before);
+        assert_eq!(fs::read_to_string(&notes).unwrap(), changed);
+        assert_eq!(fs::read_to_string(&new_file).unwrap(), "# New notes\n");
+        assert_eq!(
+            store
+                .read_resource(&owner.grant_id, "architecture", "notes")
+                .unwrap()
+                .body_md,
+            "original notes"
+        );
+        assert!(matches!(
+            store.read_resource(&owner.grant_id, "architecture", "new"),
+            Err(StoreError::NotFound(_))
+        ));
+        let scoped_owner = store
+            .create_grant(CreateGrantRequest {
+                grant_id: Some("scoped-owner".into()),
+                principal_id: owner.principal_id.clone(),
+                raw_credential: "dummy-scoped-owner".into(),
+                granted_tags: vec!["standards".into()],
+                can_write: true,
+                can_dispatch: false,
+                expires_at: None,
+                model_family: None,
+            })
+            .unwrap();
+        store.ack_rules(&scoped_owner.grant_id, &rules).unwrap();
+        assert!(matches!(
+            store.sync_vault_dir_as_owner(&dir.path, &scoped_owner.grant_id),
+            Err(StoreError::ForbiddenTag { .. })
+        ));
+        assert_eq!(fs::read_to_string(&notes).unwrap(), changed);
+        let sync = store
+            .sync_vault_dir_as_owner(&dir.path, &owner.grant_id)
+            .unwrap();
+        assert_eq!(sync.imported, 2);
+        let history = store
+            .resource_history(&owner.grant_id, "architecture", "notes")
+            .unwrap();
+        assert_eq!(history[0].body_md, "edited notes");
+        assert_eq!(history[0].author_principal, owner.principal_id);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 name: streamline-director
-description: Instructs an AI agent on acting as a Streamline Director, performing one-question-at-a-time intake, querying central lessons before starting work, scoring difficulty and risk to set profiles, maintaining requirement traces, and overseeing the mandatory 3-part version closeout gate.
+description: Use when acting as a Streamline Director to conduct one-question-at-a-time intake, query central lessons before starting work, score difficulty and risk to set profiles, maintain requirement traces, and oversee the mandatory 3-part version closeout gate.
 ---
 
 # Streamline Director Skill
@@ -33,3 +33,7 @@ As a Streamline Director, your core responsibilities are governing project intak
    - Assign static tasks to `flash_lite`, self-contained crates to `flash`, and protocol servers to `pro`.
    - Lock project plans using `lock_project_plan` before dispatching work.
    - Ensure the final closeout verifies all three mandatory gates: cleanup verification, central lesson recording, and non-technical plain-English guide approval.
+
+## Guardrails
+
+Do not dispatch work against an unlocked plan, advance a requirement without evidence, or bypass any of the three closeout gates.

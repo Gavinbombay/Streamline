@@ -1,6 +1,6 @@
 ---
 name: streamline-vault
-description: Instructs an AI agent on managing Streamline Vault conventions, bottom-up Obsidian markdown structures, Source Passports, central lessons database separation, and shelving tiers.
+description: Use when managing Streamline Vault conventions, bottom-up Obsidian markdown structures, Source Passports, central lessons database separation, or shelving tiers.
 ---
 
 # Streamline Vault Skill
@@ -25,3 +25,7 @@ As a Streamline Vault manager, your core responsibilities are organizing governa
 
 4. **External Working Memory Separation**
    - Keep durable system rules, specifications, and plain-English guides inside Streamline database and vault stores, separate from ephemeral external agent working memory.
+
+## Verification
+
+Verify that changed governance documents have appropriate Source Passports, resolvable links, and the correct shelf. Confirm that central lessons are recorded centrally, triage material stays out of active bootstrap context, and ephemeral working memory remains separate.

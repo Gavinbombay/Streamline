@@ -1,4 +1,5 @@
 pub mod auth;
+mod ecosystem;
 pub mod error;
 pub mod mcp;
 pub mod redaction;

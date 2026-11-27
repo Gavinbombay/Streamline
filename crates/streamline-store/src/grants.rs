@@ -28,6 +28,11 @@ pub(crate) fn record_audit_tx(
     let event_id = format!("evt-{}", uuid::Uuid::new_v4());
     let created_at = now_rfc3339();
     let detail_json = serde_json::to_string(&detail)?;
+    let event_bytes =
+        principal_id.len() + action.len() + target_id.len() + outcome.len() + detail_json.len();
+    if event_bytes > crate::limits::MAX_AUDIT_EVENT_BYTES {
+        return Err(StoreError::InvalidInput("audit event exceeds 2 MiB".into()));
+    }
     conn.execute(
         "INSERT INTO audit_events (
             event_id, principal_id, action, target_id, outcome, detail_json, created_at

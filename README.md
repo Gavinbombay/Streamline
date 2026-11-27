@@ -34,7 +34,7 @@ Streamline grew out of running multiple AI assistants across real engineering pr
 
 ## For AI agents
 
-Streamline exposes both a **Streamable HTTP MCP endpoint** (`POST /mcp`), a **stdio MCP loop** (`streamline mcp-stdio`), and a **typed REST tool API** (`POST /api/tools/:tool_name`) backed by the same 44-tool registry.
+Streamline exposes both a **Streamable HTTP MCP endpoint** (`POST /mcp`), a **stdio MCP loop** (`streamline mcp-stdio`), and a **typed REST tool API** (`POST /api/tools/:tool_name`) backed by the same 45-tool registry.
 
 - **Authentication**: Pass a grant credential via `Authorization: Bearer <CREDENTIAL>` or `X-Streamline-Credential: <CREDENTIAL>` (or `STREAMLINE_CREDENTIAL` in `mcp-stdio` mode). Only `GET /ready` and `ready` are unauthenticated.
 - **Mandatory rule handshake**: Call `bootstrap` first to read `current_rules_sha256` and your `granted_tags`, then call `ack_rules` with that exact digest. Any mutating tool called beforehand fails with HTTP `412` (`RULES_ACK_REQUIRED`).
@@ -43,11 +43,16 @@ Streamline exposes both a **Streamable HTTP MCP endpoint** (`POST /mcp`), a **st
 | Surface / Tool Group | Endpoint or Tools | Auth / Gate | Purpose |
 | :--- | :--- | :--- | :--- |
 | Health & Discovery | `GET /ready`, `ready`, `bootstrap`, `ack_rules` | `ready` open; `bootstrap` / `ack_rules` require credential | Inspect `rules_sha256`, read active context, unlock writes |
+| Ecosystem health | `ecosystem_brief` | Credential; read-only, no `ack_rules` | Live Diffuser fleet counts, nightly backup status, failed unit count, root disk usage, and status file metadata |
 | Shelves & Passports | `list_shelves`, `list_resources`, `read_resource`, `search_resources`, `resource_history`, `compare_resources`, `get_source_passport`, `update_source_passport`, `set_lifecycle_tier` | Credential + shelf tag; writes require `ack_rules` | Browse active or dormant shelves, inspect diffs and freshness |
 | Profile & Skills | `get_workspace`, `list_skills`, `select_context` | Credential + tag check | Inspect caller permissions and select role context |
 | Trio+ Planning & Sync | `assess_trio_work`, `create_trio_project`, `list_trio_projects`, `get_project_bundle`, `save_resource`, `save_project_documents`, `restore_resource`, `lock_project_plan`, `upsert_own_decision`, `record_divergence`, `upsert_requirement_row`, `update_requirement_stage`, `check_sync`, `save_sync_report`, `get_sync_report` | Credential + `ack_rules` + role checks | Size `P0`..`P4`, lock `OWN` rows, log `DIV`s, trace `D I T A L` |
 | Closeout, Conveyor & Lessons | `dispatch_run`, `list_runs`, `get_run`, `export_trajectory`, `mark_project_cleanup_verified`, `record_lesson`, `record_no_new_lessons`, `query_lessons`, `submit_how_it_works`, `approve_release`, `approve_how_it_works`, `record_security_audit`, `sync_vault`, `export_workspace` | `dispatch_run` requires `can_dispatch` (with project-scoped inputs for non-wildcard grants); `approve_release`, `approve_how_it_works`, `record_security_audit`, `export_trajectory`, `sync_vault`, and `export_workspace` require `owner` | Run hands-off conveyor, verify cleanup, save forward lessons, gate on `HOW-IT-WORKS` and `AUDIT_PENDING`, sync vault |
 | Web UI & Bundles | `GET /`, `GET /_streamline/assets/*`, `GET /downloads/streamline-skills.zip`, `POST /mcp`, `POST /api/tools/:tool_name` | UI and embedded static assets open on local bind; tools enforce grant auth | Streamline workspace UI, OFL fonts and SVG artwork, skill zip archive, MCP/REST dispatch |
+
+For one-call homelab health, send `tools/call` with `{"name":"ecosystem_brief","arguments":{}}`. Each source has an `available` flag; unavailable values are `null`, not zero. The backup timer and service are reported independently. The status file summary contains only its path, modification time, and line count. Host probes use fixed local Linux commands (`curl`, `systemctl`, `df`, and `timeout`); missing or failed probes do not fail the entire call.
+
+MCP batches are limited to 16 entries, including notifications, on HTTP and stdio. Oversized batches return JSON-RPC `-32600` without executing any item. Only one `ecosystem_brief` collection may run at a time per server; overlapping requests return `503 ECOSYSTEM_BRIEF_BUSY` (a tool error in MCP) and may be retried later.
 
 Example handshake over the REST tool endpoint:
 

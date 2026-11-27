@@ -11,6 +11,7 @@ use crate::grants::{
     check_shelf_access_tx, grant_has_tag_access, load_active_grant_tx, now_rfc3339,
     record_audit_tx, require_rules_acked_tx, sha256_hex,
 };
+use crate::limits::{Budget, MAX_RESULT_BYTES};
 use crate::models::{
     CreateTrioProjectRequest, RecordDivergenceRequest, ResourceRecord, SaveResourceRequest,
     SaveSyncReportRequest, SyncReport, TrioProject, TrioProjectBundle,
@@ -90,6 +91,8 @@ fn load_project_bundle_tx(
     project_id: &str,
 ) -> Result<TrioProjectBundle, StoreError> {
     let project = load_project_tx(conn, project_id)?;
+    let mut budget = Budget::new("project bundle", MAX_RESULT_BYTES);
+    budget.add(crate::limits::serialized_len(&project)?)?;
 
     let mut own_decisions = Vec::new();
     {
@@ -107,7 +110,7 @@ fn load_project_bundle_tx(
             })
         })?;
         for item in rows {
-            own_decisions.push(item?);
+            budget.push(&mut own_decisions, item?)?;
         }
     }
 
@@ -135,7 +138,7 @@ fn load_project_bundle_tx(
             })
         })?;
         for item in rows {
-            requirements.push(item?);
+            budget.push(&mut requirements, item?)?;
         }
     }
 
@@ -162,7 +165,7 @@ fn load_project_bundle_tx(
             })
         })?;
         for item in rows {
-            divergences.push(item?);
+            budget.push(&mut divergences, item?)?;
         }
     }
 
@@ -177,7 +180,7 @@ fn load_project_bundle_tx(
         )?;
         let rows = stmt.query_map(params![project_id], map_resource_row)?;
         for item in rows {
-            resources.push(item?);
+            budget.push(&mut resources, item?)?;
         }
     }
 
@@ -190,7 +193,7 @@ fn load_project_bundle_tx(
         )?;
         let rows = stmt.query_map(params![project_id], map_sync_report_row)?;
         for item in rows {
-            sync_reports.push(item?);
+            budget.push(&mut sync_reports, item?)?;
         }
     }
 
@@ -382,10 +385,11 @@ impl StreamlineStore {
         )?;
         let rows = stmt.query_map([], map_trio_project_row)?;
         let mut out = Vec::new();
+        let mut budget = Budget::new("project list", MAX_RESULT_BYTES);
         for item in rows {
             let proj = item?;
             if grant_has_tag_access(&grant, "projects", "projects", Some(&proj.project_id)) {
-                out.push(proj);
+                budget.push(&mut out, proj)?;
             }
         }
         Ok(out)
@@ -1442,8 +1446,9 @@ impl StreamlineStore {
         )?;
         let rows = stmt.query_map(params![project_id], map_conveyor_run_row)?;
         let mut runs = Vec::new();
+        let mut budget = Budget::new("conveyor runs", MAX_RESULT_BYTES);
         for item in rows {
-            runs.push(item?);
+            budget.push(&mut runs, item?)?;
         }
         Ok(runs)
     }

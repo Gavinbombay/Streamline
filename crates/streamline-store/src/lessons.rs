@@ -141,8 +141,9 @@ pub(crate) fn load_all_lessons_tx(conn: &Connection) -> Result<Vec<LessonRecord>
     )?;
     let rows = stmt.query_map([], map_lesson_row)?;
     let mut out = Vec::new();
+    let mut budget = crate::limits::Budget::new("vault lessons", crate::limits::MAX_RESULT_BYTES);
     for item in rows {
-        out.push(item?);
+        budget.push(&mut out, item?)?;
     }
     Ok(out)
 }
